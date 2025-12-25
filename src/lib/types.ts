@@ -15,6 +15,8 @@ export interface PageConfig {
   format: PageFormat;
   margins: PageMargins;
   orientation: 'portrait' | 'landscape';
+  columns: 1 | 2;
+  columnGap: number; // in mm
 }
 
 export const PAGE_FORMATS: Record<string, PageFormat> = {
@@ -22,6 +24,7 @@ export const PAGE_FORMATS: Record<string, PageFormat> = {
   A5: { name: 'A5', width: 148, height: 210 },
   LETTER: { name: 'Letter', width: 215.9, height: 279.4 },
   LEGAL: { name: 'Legal', width: 215.9, height: 355.6 },
+  TEXTBOOK: { name: 'US Textbook', width: 236.2, height: 279.4 }, // 9.3" x 11"
 };
 
 export const DEFAULT_MARGINS: PageMargins = {
@@ -76,6 +79,20 @@ export function getContentDimensions(config: PageConfig): { width: number; heigh
     width: pageDims.width - mmToPixels(margins.left) - mmToPixels(margins.right),
     height: pageDims.height - mmToPixels(margins.top) - mmToPixels(margins.bottom),
   };
+}
+
+// Get column width based on config
+export function getColumnWidth(config: PageConfig): number {
+  const contentDims = getContentDimensions(config);
+  const columns = config.columns || 1;
+  const columnGap = mmToPixels(config.columnGap || 0);
+
+  if (columns === 1) {
+    return contentDims.width;
+  }
+
+  // For 2 columns: (contentWidth - gap) / 2
+  return (contentDims.width - columnGap) / 2;
 }
 
 // Text metrics configuration

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Toolbar from './Toolbar.svelte';
-  import { pageConfig, zoomLevel, currentPage, totalPages } from './stores';
-  import { getContentDimensions, getPageDimensions, mmToPixels } from './types';
+  import { pageConfig, zoomLevel, currentPage, totalPages, fontSize as fontSizeStore, fontFamily as fontFamilyStore, headings, type HeadingItem, lineHeight as lineHeightStore, letterSpacing as letterSpacingStore, paragraphSpacing as paragraphSpacingStore } from './stores';
+  import { getContentDimensions, getPageDimensions, getColumnWidth, mmToPixels } from './types';
 
   let editorContainer: HTMLDivElement;
   let canvasContainer: HTMLDivElement;
@@ -13,13 +13,25 @@
   type TextAlign = 'left' | 'center' | 'right' | 'justify';
   type ListType = 'none' | 'bullet' | 'numbered';
   type BlockType = 'p' | 'h1' | 'h2' | 'h3' | 'h4' | 'blockquote';
-  type ImageDisplay = 'inline' | 'block' | 'float-left' | 'float-right';
+  // Image layout types (like Word)
+  type ImageWrapStyle =
+    | 'inline'        // In line with text
+    | 'square'        // Square wrapping
+    | 'tight'         // Tight wrapping (same as square for now)
+    | 'through'       // Through (same as square for now)
+    | 'top-bottom'    // Top and bottom (text above and below only)
+    | 'behind'        // Behind text
+    | 'in-front';     // In front of text
+
+  type ImagePositionMode = 'move-with-text' | 'fixed-position';
 
   interface ParagraphMeta {
     align: TextAlign;
     listType: ListType;
     blockType: BlockType;
     indent: number;
+    fontSize?: number; // Optional - if not set, uses default or heading size
+    textColor?: string; // Optional - if not set, uses default black
   }
 
   interface DocumentImage {
@@ -29,16 +41,25 @@
     height: number;
     naturalWidth: number;  // Original image width
     naturalHeight: number; // Original image height
-    display: ImageDisplay;
+    wrapStyle: ImageWrapStyle;
+    positionMode: ImagePositionMode;
+    // Horizontal alignment for non-inline images
+    horizontalAlign?: 'left' | 'center' | 'right';
     // Crop settings (percentages 0-100)
     cropTop?: number;
     cropRight?: number;
     cropBottom?: number;
     cropLeft?: number;
+    // Absolute positioning (in unscaled pixels, relative to content area)
+    x?: number;  // X position from left margin
+    y?: number;  // Y position from top of document
+    pageIndex?: number; // Which page the image is on
   }
 
   // Special marker for image paragraphs
   const IMAGE_MARKER = '\uFFFC'; // Object replacement character
+  // Special marker for page breaks
+  const PAGE_BREAK_MARKER = '\uFFFD'; // Replacement character for page break
 
   // Document state - paragraphs are logical units (separated by Enter)
   let paragraphs: string[] = $state(['']);
@@ -55,10 +76,12 @@
   let selectionStart: { para: number; offset: number } | null = $state(null);
   let selectionEnd: { para: number; offset: number } | null = $state(null);
 
-  // Text styling
-  let fontSize = $state(16);
-  let fontFamily = $state('Arial');
-  let lineHeightMultiplier = $state(1.5);
+  // Text styling - using stores for font size and family
+  let fontSize = $derived($fontSizeStore);
+  let fontFamily = $derived($fontFamilyStore);
+  let lineHeightMultiplier = $derived($lineHeightStore);
+  let letterSpacingValue = $derived($letterSpacingStore);
+  let paragraphSpacingValue = $derived($paragraphSpacingStore);
   let isBold = $state(false);
   let isItalic = $state(false);
   let isUnderline = $state(false);
@@ -81,10 +104,17 @@
   let marginTop = $derived((mmToPixels($pageConfig.margins.top) * $zoomLevel) / 100);
   let marginLeft = $derived((mmToPixels($pageConfig.margins.left) * $zoomLevel) / 100);
 
+  // Column configuration
+  let columnCount = $derived($pageConfig.columns || 1);
+  let columnGap = $derived((mmToPixels($pageConfig.columnGap || 10) * $zoomLevel) / 100);
+  let columnWidth = $derived((getColumnWidth($pageConfig) * $zoomLevel) / 100);
+
   // Calculate line metrics
   let scaledFontSize = $derived((fontSize * $zoomLevel) / 100);
   let scaledLineHeight = $derived(scaledFontSize * lineHeightMultiplier);
-  let linesPerPage = $derived(Math.floor(scaledContentHeight / scaledLineHeight));
+  let linesPerColumn = $derived(Math.floor(scaledContentHeight / scaledLineHeight));
+  // Total lines per page (across all columns)
+  let linesPerPage = $derived(linesPerColumn * columnCount);
 
   // Wrapped lines for display - computed from paragraphs
   interface DisplayLine {
@@ -98,6 +128,7 @@
     imageId?: string; // Reference to image
     imageHeight?: number; // Height in display lines
     floatReduction?: { side: 'left' | 'right'; width: number }; // Text width reduction for floats
+    isPageBreak?: boolean; // Is this a page break marker?
   }
 
   // Track selected image
@@ -123,6 +154,13 @@
   let cropStartY = $state(0);
   let cropStartValues = $state({ top: 0, right: 0, bottom: 0, left: 0 });
   let cropOriginalValues = $state({ top: 0, right: 0, bottom: 0, left: 0 }); // For cancel
+
+  // Image dragging state
+  let isDragging = $state(false);
+  let dragStartX = $state(0);
+  let dragStartY = $state(0);
+  let dragStartImageX = $state(0);
+  let dragStartImageY = $state(0);
 
   // Float image tracking for text wrapping
   interface FloatImage {
@@ -151,7 +189,10 @@
     const ctx = measureCanvas.getContext('2d');
     if (!ctx) return text.length * scaledFontSize * 0.5;
     ctx.font = getFontStyle();
-    return ctx.measureText(text).width;
+    const baseWidth = ctx.measureText(text).width;
+    // Add letter spacing for each character (except after last)
+    const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
+    return baseWidth + (text.length > 0 ? (text.length - 1) * scaledLetterSpacing : 0);
   }
 
   // Wrap a single paragraph into display lines
@@ -163,10 +204,11 @@
   ): DisplayLine[] {
     const meta = paragraphMeta[paraIndex] || getDefaultMeta();
 
-    // Calculate effective content width (account for list indent and float)
+    // Calculate effective content width (account for list indent, float, and columns)
     const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
     const floatWidth = floatReduction ? floatReduction.width + 10 : 0; // 10px gap
-    const baseContentWidth = scaledContentWidth > 0 ? scaledContentWidth : 500;
+    // Use column width instead of full content width when in multi-column mode
+    const baseContentWidth = columnWidth > 0 ? columnWidth : (scaledContentWidth > 0 ? scaledContentWidth : 500);
     const contentWidth = baseContentWidth - listIndent - floatWidth;
 
     if (!text) {
@@ -252,9 +294,86 @@
     const newActiveFloats: FloatImage[] = [];
     let numberedListCounter = 0;
 
+    // Helper to check if wrap style causes text to flow around image
+    const isFloatWrapStyle = (style: ImageWrapStyle) =>
+      style === 'square' || style === 'tight' || style === 'through';
+
+    // First, collect all floating images with absolute positions
+    // These will affect text wrapping based on their Y position
+    for (let i = 0; i < paragraphs.length; i++) {
+      const paraText = paragraphs[i];
+      if (paraText.startsWith(IMAGE_MARKER)) {
+        const imageId = paraText.substring(1);
+        const docImage = images.find(img => img.id === imageId);
+
+        if (docImage && isFloatWrapStyle(docImage.wrapStyle)) {
+          const scaledWidth = (docImage.width * $zoomLevel) / 100;
+          const scaledHeight = (docImage.height * $zoomLevel) / 100;
+          const imageLines = Math.ceil(scaledHeight / scaledLineHeight);
+
+          // If image has absolute position, calculate which lines it affects
+          if (docImage.y !== undefined) {
+            // Convert Y position to line number
+            const unscaledLineHeight = fontSize * lineHeightMultiplier;
+            const startLine = Math.floor(docImage.y / unscaledLineHeight);
+            // Determine side based on horizontal alignment or position
+            let side: 'left' | 'right';
+            if (docImage.horizontalAlign === 'right') {
+              side = 'right';
+            } else if (docImage.horizontalAlign === 'center') {
+              // For centered, determine by actual position
+              const contentCenter = contentDims.width / 2;
+              const imageCenterX = (docImage.x ?? 0) + docImage.width / 2;
+              side = imageCenterX < contentCenter ? 'left' : 'right';
+            } else {
+              side = 'left';
+            }
+            newActiveFloats.push({
+              id: imageId,
+              startLine,
+              endLine: startLine + imageLines,
+              width: scaledWidth,
+              side,
+            });
+          }
+        }
+      }
+    }
+
     for (let i = 0; i < paragraphs.length; i++) {
       const meta = paragraphMeta[i] || getDefaultMeta();
       const paraText = paragraphs[i];
+
+      // Check if this is a page break
+      if (paraText === PAGE_BREAK_MARKER) {
+        // Calculate how many lines to add to fill the current page
+        const currentLine = newDisplayLines.length;
+        const linesOnCurrentPage = currentLine % linesPerPage;
+        const linesToAdd = linesOnCurrentPage === 0 ? 0 : linesPerPage - linesOnCurrentPage;
+
+        // Add the page break marker line
+        newDisplayLines.push({
+          paraIndex: i,
+          startOffset: 0,
+          endOffset: 1,
+          text: '',
+          meta,
+          isPageBreak: true,
+        });
+
+        // Fill with empty lines to complete the page
+        for (let j = 1; j < linesToAdd; j++) {
+          newDisplayLines.push({
+            paraIndex: i,
+            startOffset: 0,
+            endOffset: 1,
+            text: '',
+            meta,
+            isPageBreak: true,
+          });
+        }
+        continue;
+      }
 
       // Check if this is an image paragraph
       if (paraText.startsWith(IMAGE_MARKER)) {
@@ -266,17 +385,33 @@
           const scaledHeight = (docImage.height * $zoomLevel) / 100;
           const imageLines = Math.ceil(scaledHeight / scaledLineHeight);
 
-          if (docImage.display === 'float-left' || docImage.display === 'float-right') {
-            // For float images, track the float for text wrapping
-            // The float starts at current line position and extends for imageLines
-            const startLine = newDisplayLines.length;
-            newActiveFloats.push({
-              id: imageId,
-              startLine,
-              endLine: startLine + imageLines,
-              width: scaledWidth,
-              side: docImage.display === 'float-left' ? 'left' : 'right',
-            });
+          if (isFloatWrapStyle(docImage.wrapStyle)) {
+            // For float images without absolute position, track the float for text wrapping
+            if (docImage.y === undefined) {
+              const startLine = newDisplayLines.length;
+              // Check if this float was already added (has absolute position)
+              const existingFloat = newActiveFloats.find(f => f.id === imageId);
+              if (!existingFloat) {
+                // Determine side based on horizontal alignment
+                let side: 'left' | 'right';
+                if (docImage.horizontalAlign === 'right') {
+                  side = 'right';
+                } else if (docImage.horizontalAlign === 'center') {
+                  const contentCenter = contentDims.width / 2;
+                  const imageCenterX = (docImage.x ?? 0) + docImage.width / 2;
+                  side = imageCenterX < contentCenter ? 'left' : 'right';
+                } else {
+                  side = 'left';
+                }
+                newActiveFloats.push({
+                  id: imageId,
+                  startLine,
+                  endLine: startLine + imageLines,
+                  width: scaledWidth,
+                  side,
+                });
+              }
+            }
 
             // Float images don't add display lines - they float alongside text
             // We still need to track the paragraph though for deletion purposes
@@ -290,6 +425,72 @@
               isImage: true,
               imageId: imageId,
               imageHeight: imageLines, // Store for rendering purposes
+            });
+          } else if (docImage.wrapStyle === 'inline') {
+            // Inline images are treated as part of text - but for simplicity,
+            // we still give them their own paragraph line
+            newDisplayLines.push({
+              paraIndex: i,
+              startOffset: 0,
+              endOffset: paraText.length,
+              text: '',
+              meta,
+              isImage: true,
+              imageId: imageId,
+              imageHeight: imageLines,
+            });
+
+            // Add placeholder lines for the image height
+            for (let j = 1; j < imageLines; j++) {
+              newDisplayLines.push({
+                paraIndex: i,
+                startOffset: 0,
+                endOffset: paraText.length,
+                text: '',
+                meta,
+                isImage: true,
+                imageId: imageId,
+                imageHeight: 0, // Not the first line
+              });
+            }
+          } else if (docImage.wrapStyle === 'top-bottom') {
+            // Top and bottom - image takes up space, text flows above and below only
+            newDisplayLines.push({
+              paraIndex: i,
+              startOffset: 0,
+              endOffset: paraText.length,
+              text: '',
+              meta,
+              isImage: true,
+              imageId: imageId,
+              imageHeight: imageLines,
+            });
+
+            // Add placeholder lines for the image height
+            for (let j = 1; j < imageLines; j++) {
+              newDisplayLines.push({
+                paraIndex: i,
+                startOffset: 0,
+                endOffset: paraText.length,
+                text: '',
+                meta,
+                isImage: true,
+                imageId: imageId,
+                imageHeight: 0,
+              });
+            }
+          } else if (docImage.wrapStyle === 'behind' || docImage.wrapStyle === 'in-front') {
+            // Behind/in-front - image doesn't affect text flow at all
+            // Just add a marker for tracking purposes
+            newDisplayLines.push({
+              paraIndex: i,
+              startOffset: 0,
+              endOffset: paraText.length,
+              text: '',
+              meta,
+              isImage: true,
+              imageId: imageId,
+              imageHeight: 0, // No height impact on text
             });
           } else {
             // Block image - takes up full width and vertical space
@@ -369,6 +570,30 @@
     activeFloats = newActiveFloats;
     displayLines = newDisplayLines;
     totalPages.set(numPages);
+
+    // Update headings store for navigation sidebar
+    updateHeadings();
+  }
+
+  // Extract headings from paragraphs and update the store
+  function updateHeadings() {
+    const newHeadings: HeadingItem[] = [];
+    for (let i = 0; i < paragraphs.length; i++) {
+      const meta = paragraphMeta[i] || getDefaultMeta();
+      const blockType = meta.blockType;
+      if (blockType.startsWith('h')) {
+        const level = parseInt(blockType[1]);
+        if (level >= 1 && level <= 4) {
+          newHeadings.push({
+            id: `heading-${i}`,
+            text: paragraphs[i],
+            level,
+            paraIndex: i,
+          });
+        }
+      }
+    }
+    headings.set(newHeadings);
   }
 
   // Convert paragraph position to display line position
@@ -393,6 +618,27 @@
     return { para: dl.paraIndex, offset: dl.startOffset + Math.min(col, dl.text.length) };
   }
 
+  // Navigate to a specific paragraph (for sidebar navigation)
+  export function navigateToParagraph(paraIndex: number) {
+    if (paraIndex < 0 || paraIndex >= paragraphs.length) return;
+
+    // Move cursor to the beginning of the paragraph
+    cursorPara = paraIndex;
+    cursorOffset = 0;
+    selectionStart = null;
+    selectionEnd = null;
+
+    // Update current page
+    const displayPos = paraToDisplayPos(cursorPara, cursorOffset);
+    const pageNum = Math.floor(displayPos.line / linesPerPage) + 1;
+    currentPage.set(pageNum);
+
+    // Scroll to show the paragraph
+    scrollToCursor();
+    hiddenTextarea?.focus();
+    renderAllPages();
+  }
+
   onMount(() => {
     hiddenTextarea?.focus();
     // Wait for next tick to ensure measureCanvas is bound
@@ -410,12 +656,14 @@
       handlePaste(event);
     };
 
-    // Global mouse handlers for resize and crop
+    // Global mouse handlers for resize, crop, and drag
     const handleGlobalMouseMove = (event: MouseEvent) => {
       if (isResizing) {
         handleResizeMove(event.clientX, event.clientY);
       } else if (isCropping && cropHandle) {
         handleCropMove(event.clientX, event.clientY);
+      } else if (isDragging) {
+        handleDragMove(event.clientX, event.clientY);
       }
     };
 
@@ -425,6 +673,9 @@
       }
       if (cropHandle) {
         endCropDrag();
+      }
+      if (isDragging) {
+        endDrag();
       }
     };
 
@@ -450,6 +701,137 @@
       renderAllPages();
     }
   });
+
+  // Helper function to render a single image
+  function renderImage(
+    ctx: CanvasRenderingContext2D,
+    docImage: DocumentImage,
+    img: HTMLImageElement,
+    imageX: number,
+    imageY: number,
+    pageIndex: number
+  ) {
+    const scaledWidth = (docImage.width * $zoomLevel) / 100;
+
+    // Draw the image with crop applied
+    const cropTop = docImage.cropTop || 0;
+    const cropRight = docImage.cropRight || 0;
+    const cropBottom = docImage.cropBottom || 0;
+    const cropLeft = docImage.cropLeft || 0;
+
+    const srcX = (cropLeft / 100) * img.naturalWidth;
+    const srcY = (cropTop / 100) * img.naturalHeight;
+    const srcW = ((100 - cropLeft - cropRight) / 100) * img.naturalWidth;
+    const srcH = ((100 - cropTop - cropBottom) / 100) * img.naturalHeight;
+
+    const cropAspect = srcW / srcH;
+    const destW = scaledWidth;
+    const destH = scaledWidth / cropAspect;
+
+    // Apply opacity for behind images
+    if (docImage.wrapStyle === 'behind') {
+      ctx.globalAlpha = 0.5;
+    }
+
+    ctx.drawImage(img, srcX, srcY, srcW, srcH, imageX, imageY, destW, destH);
+
+    // Reset opacity
+    ctx.globalAlpha = 1;
+
+    // Draw selection border if selected
+    if (selectedImageId === docImage.id) {
+      ctx.strokeStyle = isDragging ? '#4caf50' : '#1a73e8';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
+      ctx.strokeRect(imageX - 2, imageY - 2, destW + 4, destH + 4);
+
+      // Draw resize handles (8 handles)
+      const handleSize = 8;
+      ctx.fillStyle = isCropping ? '#ff9800' : (isDragging ? '#4caf50' : '#1a73e8');
+
+      // Corners
+      ctx.fillRect(imageX - handleSize/2, imageY - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX + destW - handleSize/2, imageY - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX - handleSize/2, imageY + destH - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX + destW - handleSize/2, imageY + destH - handleSize/2, handleSize, handleSize);
+
+      // Edge midpoints
+      ctx.fillRect(imageX + destW/2 - handleSize/2, imageY - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX + destW/2 - handleSize/2, imageY + destH - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX - handleSize/2, imageY + destH/2 - handleSize/2, handleSize, handleSize);
+      ctx.fillRect(imageX + destW - handleSize/2, imageY + destH/2 - handleSize/2, handleSize, handleSize);
+
+      // Draw move cursor indicator when dragging
+      if (isDragging) {
+        ctx.fillStyle = 'rgba(76, 175, 80, 0.2)';
+        ctx.fillRect(imageX, imageY, destW, destH);
+      }
+
+      // Draw crop mode indicator
+      if (isCropping) {
+        ctx.strokeStyle = '#ff9800';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.strokeRect(imageX, imageY, destW, destH);
+        ctx.setLineDash([]);
+      }
+    } else {
+      // Draw subtle border
+      ctx.strokeStyle = '#e0e0e0';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([]);
+      ctx.strokeRect(imageX, imageY, destW, destH);
+    }
+  }
+
+  // Helper to calculate image position
+  function getImagePosition(
+    docImage: DocumentImage,
+    displayLineIdx: number,
+    pageIndex: number,
+    startLine: number
+  ): { x: number; y: number; visible: boolean } {
+    const scaledWidth = (docImage.width * $zoomLevel) / 100;
+
+    // Check if image has absolute position (has been dragged)
+    if (docImage.x !== undefined && docImage.y !== undefined) {
+      const pageHeight = contentDims.height;
+      const imagePageIndex = Math.floor(docImage.y / pageHeight);
+
+      if (imagePageIndex === pageIndex) {
+        const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+        const imageX = marginLeft + (docImage.x * $zoomLevel) / 100;
+        const imageY = marginTop + (yOnPage * $zoomLevel) / 100;
+        return { x: imageX, y: imageY, visible: true };
+      }
+      return { x: 0, y: 0, visible: false };
+    }
+
+    // Use line-based positioning
+    const lineOnPage = displayLineIdx - startLine;
+    if (lineOnPage < 0 || lineOnPage >= linesPerPage) {
+      return { x: 0, y: 0, visible: false };
+    }
+
+    // Calculate column and line within column for multi-column layout
+    const colIndex = columnCount > 1 ? Math.floor(lineOnPage / linesPerColumn) : 0;
+    const lineInCol = columnCount > 1 ? lineOnPage % linesPerColumn : lineOnPage;
+    const columnOffsetX = colIndex * (columnWidth + columnGap);
+
+    const imageY = marginTop + lineInCol * scaledLineHeight;
+
+    // Calculate X position based on horizontal alignment
+    let imageX: number;
+    if (docImage.horizontalAlign === 'center') {
+      imageX = marginLeft + columnOffsetX + (columnWidth - scaledWidth) / 2;
+    } else if (docImage.horizontalAlign === 'right') {
+      imageX = marginLeft + columnOffsetX + columnWidth - scaledWidth;
+    } else {
+      imageX = marginLeft + columnOffsetX;
+    }
+
+    return { x: imageX, y: imageY, visible: true };
+  }
 
   function renderAllPages() {
     const pageCount = numPages;
@@ -500,172 +882,100 @@
         }
       }
 
-      // First pass: render float images for this page
-      for (const float of activeFloats) {
-        // Check if this float is visible on this page
-        const floatStartLineOnPage = float.startLine - startLine;
-        if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
-          const docImage = images.find(img => img.id === float.id);
-          const img = docImage ? loadedImages.get(docImage.id) : null;
+      // === PASS 1: Render "behind" images first (before text) ===
+      for (const dl of displayLines) {
+        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
 
-          if (docImage && img) {
-            const scaledWidth = (docImage.width * $zoomLevel) / 100;
-            const scaledHeight = (docImage.height * $zoomLevel) / 100;
-            const floatY = marginTop + floatStartLineOnPage * scaledLineHeight;
-            const floatX = float.side === 'left' ? marginLeft : marginLeft + scaledContentWidth - scaledWidth;
+        const docImage = images.find(img => img.id === dl.imageId);
+        if (!docImage || docImage.wrapStyle !== 'behind') continue;
 
-            // Draw the image with crop applied
-            const cropTop = docImage.cropTop || 0;
-            const cropRight = docImage.cropRight || 0;
-            const cropBottom = docImage.cropBottom || 0;
-            const cropLeft = docImage.cropLeft || 0;
+        const img = loadedImages.get(docImage.id);
+        if (!img) continue;
 
-            const srcX = (cropLeft / 100) * img.naturalWidth;
-            const srcY = (cropTop / 100) * img.naturalHeight;
-            const srcW = ((100 - cropLeft - cropRight) / 100) * img.naturalWidth;
-            const srcH = ((100 - cropTop - cropBottom) / 100) * img.naturalHeight;
-
-            const cropAspect = srcW / srcH;
-            let destW = scaledWidth;
-            let destH = scaledWidth / cropAspect;
-
-            ctx.drawImage(img, srcX, srcY, srcW, srcH, floatX, floatY, destW, destH);
-
-            // Draw selection border if selected
-            if (selectedImageId === docImage.id) {
-              ctx.strokeStyle = '#1a73e8';
-              ctx.lineWidth = 2;
-              ctx.setLineDash([]);
-              ctx.strokeRect(floatX - 2, floatY - 2, destW + 4, destH + 4);
-
-              // Draw resize handles (8 handles)
-              const handleSize = 8;
-              ctx.fillStyle = isCropping ? '#ff9800' : '#1a73e8';
-
-              // Corners
-              ctx.fillRect(floatX - handleSize/2, floatY - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX + destW - handleSize/2, floatY - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX - handleSize/2, floatY + destH - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX + destW - handleSize/2, floatY + destH - handleSize/2, handleSize, handleSize);
-
-              // Edge midpoints
-              ctx.fillRect(floatX + destW/2 - handleSize/2, floatY - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX + destW/2 - handleSize/2, floatY + destH - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX - handleSize/2, floatY + destH/2 - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(floatX + destW - handleSize/2, floatY + destH/2 - handleSize/2, handleSize, handleSize);
-
-              // Draw crop mode indicator
-              if (isCropping) {
-                ctx.strokeStyle = '#ff9800';
-                ctx.lineWidth = 2;
-                ctx.setLineDash([5, 5]);
-                ctx.strokeRect(floatX, floatY, destW, destH);
-                ctx.setLineDash([]);
-              }
-            } else {
-              ctx.strokeStyle = '#e0e0e0';
-              ctx.lineWidth = 1;
-              ctx.setLineDash([]);
-              ctx.strokeRect(floatX, floatY, destW, destH);
-            }
-          }
+        const displayLineIdx = displayLines.indexOf(dl);
+        const pos = getImagePosition(docImage, displayLineIdx, pageIndex, startLine);
+        if (pos.visible) {
+          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
         }
       }
 
-      // Render display lines for this page
+      // === PASS 2: Render float images (square, tight, through) ===
+      for (const float of activeFloats) {
+        const docImage = images.find(img => img.id === float.id);
+        if (!docImage) continue;
+
+        const img = loadedImages.get(docImage.id);
+        if (!img) continue;
+
+        const scaledWidth = (docImage.width * $zoomLevel) / 100;
+
+        let floatX: number;
+        let floatY: number;
+        let isVisibleOnPage = false;
+
+        // Check if image has absolute position
+        if (docImage.x !== undefined && docImage.y !== undefined) {
+          const pageHeight = contentDims.height;
+          const imagePageIndex = Math.floor(docImage.y / pageHeight);
+
+          if (imagePageIndex === pageIndex) {
+            const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+            floatX = marginLeft + (docImage.x * $zoomLevel) / 100;
+            floatY = marginTop + (yOnPage * $zoomLevel) / 100;
+            isVisibleOnPage = true;
+          }
+        } else {
+          // Use line-based positioning
+          const floatStartLineOnPage = float.startLine - startLine;
+          if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
+            const floatColIndex = columnCount > 1 ? Math.floor(floatStartLineOnPage / linesPerColumn) : 0;
+            const floatLineInCol = columnCount > 1 ? floatStartLineOnPage % linesPerColumn : floatStartLineOnPage;
+            const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
+
+            floatY = marginTop + floatLineInCol * scaledLineHeight;
+            floatX = float.side === 'left'
+              ? marginLeft + floatColumnOffsetX
+              : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
+            isVisibleOnPage = true;
+          }
+        }
+
+        if (isVisibleOnPage) {
+          renderImage(ctx, docImage, img, floatX!, floatY!, pageIndex);
+        }
+      }
+
+      // === PASS 3: Render inline and top-bottom images ===
       for (let i = startLine; i < endLine; i++) {
-        const lineIndex = i - startLine;
-        const y = marginTop + lineIndex * scaledLineHeight;
+        const dl = displayLines[i];
+        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
+
+        const docImage = images.find(img => img.id === dl.imageId);
+        if (!docImage) continue;
+
+        // Only render inline and top-bottom here
+        if (docImage.wrapStyle !== 'inline' && docImage.wrapStyle !== 'top-bottom') continue;
+
+        const img = loadedImages.get(docImage.id);
+        if (!img) continue;
+
+        const pos = getImagePosition(docImage, i, pageIndex, startLine);
+        if (pos.visible) {
+          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
+        }
+      }
+
+      // === PASS 4: Render text ===
+      for (let i = startLine; i < endLine; i++) {
+        const lineIndexOnPage = i - startLine;
+        const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
+        const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
+        const columnOffsetX = colIndex * (columnWidth + columnGap);
+        const y = marginTop + lineInColumn * scaledLineHeight;
         const dl = displayLines[i];
 
-        // Handle block image rendering (non-float)
-        if (dl.isImage && dl.imageId) {
-          const docImage = images.find(img => img.id === dl.imageId);
-
-          // Skip float images (they're rendered separately in the first pass)
-          if (docImage && (docImage.display === 'float-left' || docImage.display === 'float-right')) {
-            continue;
-          }
-
-          // Only render block images on their first line (imageHeight > 0)
-          if (!dl.imageHeight || dl.imageHeight <= 0) {
-            continue;
-          }
-
-          const img = docImage ? loadedImages.get(docImage.id) : null;
-
-          if (docImage && img) {
-            const scaledWidth = (docImage.width * $zoomLevel) / 100;
-            const scaledHeight = (docImage.height * $zoomLevel) / 100;
-
-            // Center the image
-            const imageX = marginLeft + (scaledContentWidth - scaledWidth) / 2;
-
-            // Draw the image with crop applied
-            const cropTop = docImage.cropTop || 0;
-            const cropRight = docImage.cropRight || 0;
-            const cropBottom = docImage.cropBottom || 0;
-            const cropLeft = docImage.cropLeft || 0;
-
-            // Calculate source rect from crop percentages
-            const srcX = (cropLeft / 100) * img.naturalWidth;
-            const srcY = (cropTop / 100) * img.naturalHeight;
-            const srcW = ((100 - cropLeft - cropRight) / 100) * img.naturalWidth;
-            const srcH = ((100 - cropTop - cropBottom) / 100) * img.naturalHeight;
-
-            // Calculate destination dimensions maintaining aspect ratio
-            const cropAspect = srcW / srcH;
-            let destW = scaledWidth;
-            let destH = scaledWidth / cropAspect;
-
-            ctx.drawImage(img, srcX, srcY, srcW, srcH, imageX, y, destW, destH);
-
-            // Draw selection border if selected
-            if (selectedImageId === docImage.id) {
-              ctx.strokeStyle = '#1a73e8';
-              ctx.lineWidth = 2;
-              ctx.setLineDash([]);
-              ctx.strokeRect(imageX - 2, y - 2, destW + 4, destH + 4);
-
-              // Draw resize handles (8 handles: 4 corners + 4 edges)
-              const handleSize = 8;
-              ctx.fillStyle = isCropping ? '#ff9800' : '#1a73e8';
-
-              // Corners
-              ctx.fillRect(imageX - handleSize/2, y - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX + destW - handleSize/2, y - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX - handleSize/2, y + destH - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX + destW - handleSize/2, y + destH - handleSize/2, handleSize, handleSize);
-
-              // Edge midpoints
-              ctx.fillRect(imageX + destW/2 - handleSize/2, y - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX + destW/2 - handleSize/2, y + destH - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX - handleSize/2, y + destH/2 - handleSize/2, handleSize, handleSize);
-              ctx.fillRect(imageX + destW - handleSize/2, y + destH/2 - handleSize/2, handleSize, handleSize);
-
-              // Draw crop mode indicator
-              if (isCropping) {
-                ctx.strokeStyle = '#ff9800';
-                ctx.lineWidth = 2;
-                ctx.setLineDash([5, 5]);
-                ctx.strokeRect(imageX, y, destW, destH);
-                ctx.setLineDash([]);
-              }
-            } else {
-              // Draw subtle border
-              ctx.strokeStyle = '#e0e0e0';
-              ctx.lineWidth = 1;
-              ctx.setLineDash([]);
-              ctx.strokeRect(imageX, y, destW, destH);
-            }
-          }
-          continue; // Skip normal text rendering for image lines
-        }
-
-        // Skip placeholder lines for images (they don't render anything)
-        if (dl.isImage) {
-          continue;
-        }
+        // Skip image lines and page break lines
+        if (dl.isImage || dl.isPageBreak) continue;
 
         const text = dl.text;
         const meta = dl.meta;
@@ -673,24 +983,26 @@
         // Calculate list indent and float offset
         const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
         const floatOffset = dl.floatReduction && dl.floatReduction.side === 'left' ? dl.floatReduction.width + 10 : 0;
-        const textStartX = marginLeft + listIndent + floatOffset;
+        const textStartX = marginLeft + columnOffsetX + listIndent + floatOffset;
 
         // Get font style based on block type
-        let blockFontSize = scaledFontSize;
+        // Use paragraph-specific font size if set, otherwise use global
+        const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+        let blockFontSize = baseFontSize;
         let blockFontWeight = isBold ? 'bold ' : '';
         let blockFontStyle = isItalic ? 'italic ' : '';
 
         switch (meta.blockType) {
           case 'h1':
-            blockFontSize = scaledFontSize * 2;
+            blockFontSize = baseFontSize * 2;
             blockFontWeight = 'bold ';
             break;
           case 'h2':
-            blockFontSize = scaledFontSize * 1.5;
+            blockFontSize = baseFontSize * 1.5;
             blockFontWeight = 'bold ';
             break;
           case 'h3':
-            blockFontSize = scaledFontSize * 1.17;
+            blockFontSize = baseFontSize * 1.17;
             blockFontWeight = 'bold ';
             break;
           case 'h4':
@@ -704,12 +1016,10 @@
         const lineFont = `${blockFontStyle}${blockFontWeight}${blockFontSize}px ${fontFamily}`;
         ctx.font = lineFont;
 
-        // Measure text width for alignment
         const textWidth = ctx.measureText(text).width;
         const floatWidthReduction = dl.floatReduction ? dl.floatReduction.width + 10 : 0;
-        const availableWidth = scaledContentWidth - listIndent - floatWidthReduction;
+        const availableWidth = columnWidth - listIndent - floatWidthReduction;
 
-        // Calculate x position and word spacing based on alignment
         let x = textStartX;
         let wordSpacing = 0;
         const words = text.split(' ');
@@ -723,7 +1033,6 @@
             x = textStartX + availableWidth - textWidth;
             break;
           case 'justify':
-            // Only justify if not the last line of the paragraph and has multiple words
             if (!isLastLineOfPara && words.length > 1 && text.trim().length > 0) {
               const extraSpace = availableWidth - textWidth;
               wordSpacing = extraSpace / (words.length - 1);
@@ -737,10 +1046,8 @@
             ctx.fillStyle = '#b4d7ff';
             const startCol = i === selStartDisplay.line ? selStartDisplay.col : 0;
             const endCol = i === selEndDisplay.line ? selEndDisplay.col : text.length;
-
             const selStartX = x + ctx.measureText(text.substring(0, startCol)).width;
             const selWidth = ctx.measureText(text.substring(startCol, endCol)).width || 5;
-
             ctx.fillRect(selStartX, y, selWidth, scaledLineHeight);
           }
         }
@@ -749,17 +1056,15 @@
         if (dl.startOffset === 0 && meta.listType !== 'none') {
           ctx.fillStyle = '#202124';
           if (meta.listType === 'bullet') {
-            // Draw bullet point
-            const bulletX = marginLeft + scaledFontSize * 0.5;
+            const bulletX = marginLeft + columnOffsetX + scaledFontSize * 0.5;
             const bulletY = y + scaledLineHeight / 2;
             ctx.beginPath();
             ctx.arc(bulletX, bulletY, scaledFontSize * 0.15, 0, Math.PI * 2);
             ctx.fill();
           } else if (meta.listType === 'numbered' && dl.listNumber) {
-            // Draw number
             ctx.font = `${scaledFontSize}px ${fontFamily}`;
             ctx.textAlign = 'right';
-            ctx.fillText(`${dl.listNumber}.`, marginLeft + scaledFontSize * 1.2, y + (scaledLineHeight - scaledFontSize) / 2);
+            ctx.fillText(`${dl.listNumber}.`, marginLeft + columnOffsetX + scaledFontSize * 1.2, y + (scaledLineHeight - scaledFontSize) / 2);
             ctx.textAlign = 'left';
             ctx.font = lineFont;
           }
@@ -768,29 +1073,43 @@
         // Draw blockquote indicator
         if (meta.blockType === 'blockquote' && dl.startOffset === 0) {
           ctx.fillStyle = '#ccc';
-          ctx.fillRect(marginLeft, y, 3, scaledLineHeight);
+          ctx.fillRect(marginLeft + columnOffsetX, y, 3, scaledLineHeight);
         }
 
-        // Draw text (with word spacing for justify)
-        ctx.fillStyle = '#202124';
+        // Draw text
+        ctx.fillStyle = meta.textColor || '#202124';
         ctx.font = lineFont;
         const textY = y + (scaledLineHeight - blockFontSize) / 2;
+        const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
+
+        // Function to draw text with letter spacing
+        const drawTextWithSpacing = (str: string, startX: number) => {
+          if (scaledLetterSpacing === 0) {
+            ctx.fillText(str, startX, textY);
+            return ctx.measureText(str).width;
+          } else {
+            let charX = startX;
+            for (let c = 0; c < str.length; c++) {
+              ctx.fillText(str[c], charX, textY);
+              charX += ctx.measureText(str[c]).width + scaledLetterSpacing;
+            }
+            return charX - startX - scaledLetterSpacing; // subtract last spacing
+          }
+        };
 
         if (wordSpacing > 0 && meta.align === 'justify') {
-          // Draw words individually with extra spacing
           let wordX = x;
           for (let w = 0; w < words.length; w++) {
-            ctx.fillText(words[w], wordX, textY);
-            wordX += ctx.measureText(words[w]).width;
+            drawTextWithSpacing(words[w], wordX);
+            wordX += ctx.measureText(words[w]).width + (words[w].length * scaledLetterSpacing);
             if (w < words.length - 1) {
               wordX += ctx.measureText(' ').width + wordSpacing;
             }
           }
         } else {
-          ctx.fillText(text, x, textY);
+          drawTextWithSpacing(text, x);
         }
 
-        // Calculate actual rendered width for decorations
         const renderedWidth = wordSpacing > 0 ? availableWidth : textWidth;
 
         // Draw underline
@@ -815,11 +1134,10 @@
           ctx.stroke();
         }
 
-        // Draw cursor - account for word spacing in justify mode
+        // Draw cursor
         if (i === cursorDisplay.line && !selectionStart) {
           let cursorX = x;
           if (wordSpacing > 0 && meta.align === 'justify') {
-            // Calculate cursor position with word spacing
             const textBeforeCursor = text.substring(0, cursorDisplay.col);
             const wordsBeforeCursor = textBeforeCursor.split(' ');
             const spacesBeforeCursor = wordsBeforeCursor.length - 1;
@@ -829,6 +1147,23 @@
           }
           ctx.fillStyle = '#000';
           ctx.fillRect(cursorX, y + 2, 2, scaledLineHeight - 4);
+        }
+      }
+
+      // === PASS 5: Render "in-front" images last (after text) ===
+      for (const dl of displayLines) {
+        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
+
+        const docImage = images.find(img => img.id === dl.imageId);
+        if (!docImage || docImage.wrapStyle !== 'in-front') continue;
+
+        const img = loadedImages.get(docImage.id);
+        if (!img) continue;
+
+        const displayLineIdx = displayLines.indexOf(dl);
+        const pos = getImagePosition(docImage, displayLineIdx, pageIndex, startLine);
+        if (pos.visible) {
+          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
         }
       }
 
@@ -855,6 +1190,13 @@
     if (selectedImageId && key !== 'Delete' && key !== 'Backspace') {
       selectedImageId = null;
       renderAllPages();
+    }
+
+    // Alt+Enter for page break
+    if (event.altKey && key === 'Enter') {
+      event.preventDefault();
+      insertPageBreak();
+      return;
     }
 
     if (event.ctrlKey || event.metaKey) {
@@ -1029,11 +1371,13 @@
           const after = paragraphs[cursorPara].substring(cursorOffset);
           paragraphs[cursorPara] = before;
           paragraphs = [...paragraphs.slice(0, cursorPara + 1), after, ...paragraphs.slice(cursorPara + 1)];
-          // Copy current paragraph's metadata to new paragraph (inherit formatting)
+          // Copy current paragraph's metadata to new paragraph
           const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+          // Reset block type to normal 'p' for new line after headings
+          const newBlockType = currentMeta.blockType.startsWith('h') ? 'p' : currentMeta.blockType;
           paragraphMeta = [
             ...paragraphMeta.slice(0, cursorPara + 1),
-            { ...currentMeta },
+            { ...currentMeta, blockType: newBlockType as BlockType },
             ...paragraphMeta.slice(cursorPara + 1)
           ];
           cursorPara++;
@@ -1102,6 +1446,43 @@
     recomputeDisplayLines();
   }
 
+  function insertPageBreak() {
+    if (selectionStart && selectionEnd) {
+      deleteSelection();
+    }
+
+    // Split current paragraph at cursor
+    const before = paragraphs[cursorPara].substring(0, cursorOffset);
+    const after = paragraphs[cursorPara].substring(cursorOffset);
+
+    // Current paragraph becomes text before cursor
+    paragraphs[cursorPara] = before;
+
+    // Insert page break paragraph and text after cursor
+    paragraphs = [
+      ...paragraphs.slice(0, cursorPara + 1),
+      PAGE_BREAK_MARKER,
+      after,
+      ...paragraphs.slice(cursorPara + 1)
+    ];
+
+    // Add metadata for new paragraphs
+    const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+    paragraphMeta = [
+      ...paragraphMeta.slice(0, cursorPara + 1),
+      { ...getDefaultMeta() }, // Page break meta (not really used)
+      { ...currentMeta }, // After text meta
+      ...paragraphMeta.slice(cursorPara + 1)
+    ];
+
+    // Move cursor to after the page break
+    cursorPara += 2;
+    cursorOffset = 0;
+
+    recomputeDisplayLines();
+    renderAllPages();
+  }
+
   function getSelectedText(): string {
     if (!selectionStart || !selectionEnd) return '';
 
@@ -1167,7 +1548,7 @@
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
 
-    // Check if clicking on a resize handle of a selected image
+    // Check if clicking on a resize handle or inside a selected image
     if (selectedImageId && !isCropping) {
       const bounds = getSelectedImageBounds();
       if (bounds && bounds.pageIndex === pageIndex) {
@@ -1175,6 +1556,12 @@
         if (handle) {
           event.preventDefault();
           startResize(handle, event.clientX, event.clientY);
+          return;
+        }
+        // Check if clicking inside the image (for dragging)
+        if (x >= bounds.x && x <= bounds.x + bounds.width && y >= bounds.y && y <= bounds.y + bounds.height) {
+          event.preventDefault();
+          startDrag(event.clientX, event.clientY, pageIndex);
           return;
         }
       }
@@ -1193,46 +1580,100 @@
       }
     }
 
-    // Calculate which display line was clicked
-    const lineInPage = Math.floor((y - marginTop) / scaledLineHeight);
-    const displayLineIndex = pageIndex * linesPerPage + lineInPage;
+    // Calculate which display line was clicked (accounting for columns)
+    const lineInColumn = Math.floor((y - marginTop) / scaledLineHeight);
+
+    // Determine which column was clicked
+    let clickedColumn = 0;
+    if (columnCount > 1) {
+      const xInContent = x - marginLeft;
+      if (xInContent >= columnWidth + columnGap) {
+        clickedColumn = 1;
+      }
+    }
+
+    // Calculate display line index: (page * linesPerPage) + (column * linesPerColumn) + lineInColumn
+    const displayLineIndex = pageIndex * linesPerPage + clickedColumn * linesPerColumn + lineInColumn;
 
     // Check if clicked on a float image first
     for (const float of activeFloats) {
-      const floatStartLineOnPage = float.startLine - (pageIndex * linesPerPage);
-      if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
-        const docImage = images.find(img => img.id === float.id);
-        if (docImage) {
-          const scaledWidth = (docImage.width * $zoomLevel) / 100;
-          const scaledHeight = (docImage.height * $zoomLevel) / 100;
-          const floatY = marginTop + floatStartLineOnPage * scaledLineHeight;
-          const floatX = float.side === 'left' ? marginLeft : marginLeft + scaledContentWidth - scaledWidth;
+      const docImage = images.find(img => img.id === float.id);
+      if (docImage) {
+        const scaledWidth = (docImage.width * $zoomLevel) / 100;
+        const scaledHeight = (docImage.height * $zoomLevel) / 100;
 
-          if (x >= floatX && x <= floatX + scaledWidth && y >= floatY && y <= floatY + scaledHeight) {
-            selectedImageId = docImage.id;
-            selectionStart = null;
-            selectionEnd = null;
-            // Show options popup near the image
-            showImageOptions(event.clientX, event.clientY);
-            hiddenTextarea?.focus();
-            renderAllPages();
-            return;
+        let floatX: number;
+        let floatY: number;
+        let isVisibleOnPage = false;
+
+        // Check if image has absolute position
+        if (docImage.x !== undefined && docImage.y !== undefined) {
+          const pageHeight = contentDims.height;
+          const imagePageIndex = Math.floor(docImage.y / pageHeight);
+
+          if (imagePageIndex === pageIndex) {
+            const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+            floatX = marginLeft + (docImage.x * $zoomLevel) / 100;
+            floatY = marginTop + (yOnPage * $zoomLevel) / 100;
+            isVisibleOnPage = true;
           }
+        } else {
+          // Use line-based positioning (accounting for columns)
+          const floatStartLineOnPage = float.startLine - (pageIndex * linesPerPage);
+          if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
+            // Calculate column and line within column for multi-column layout
+            const floatColIndex = columnCount > 1 ? Math.floor(floatStartLineOnPage / linesPerColumn) : 0;
+            const floatLineInCol = columnCount > 1 ? floatStartLineOnPage % linesPerColumn : floatStartLineOnPage;
+            const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
+
+            floatY = marginTop + floatLineInCol * scaledLineHeight;
+            floatX = float.side === 'left'
+              ? marginLeft + floatColumnOffsetX
+              : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
+            isVisibleOnPage = true;
+          }
+        }
+
+        if (isVisibleOnPage && x >= floatX! && x <= floatX! + scaledWidth && y >= floatY! && y <= floatY! + scaledHeight) {
+          selectedImageId = docImage.id;
+          selectionStart = null;
+          selectionEnd = null;
+          // Show options popup near the image
+          showImageOptions(event.clientX, event.clientY);
+          hiddenTextarea?.focus();
+          renderAllPages();
+          return;
         }
       }
     }
 
-    // Check if clicked on a block image
+    // Check if clicked on a non-float image (inline, top-bottom, behind, in-front)
     if (displayLineIndex >= 0 && displayLineIndex < displayLines.length) {
       const dl = displayLines[displayLineIndex];
 
       if (dl.isImage && dl.imageId) {
         // Find the image and check if click is within its bounds
         const docImage = images.find(img => img.id === dl.imageId);
-        if (docImage && docImage.display !== 'float-left' && docImage.display !== 'float-right') {
+        const isNonFloatImage = docImage && (
+          docImage.wrapStyle === 'inline' ||
+          docImage.wrapStyle === 'top-bottom' ||
+          docImage.wrapStyle === 'behind' ||
+          docImage.wrapStyle === 'in-front'
+        );
+        if (isNonFloatImage) {
           const scaledWidth = (docImage.width * $zoomLevel) / 100;
           const scaledHeight = (docImage.height * $zoomLevel) / 100;
-          const imageX = marginLeft + (scaledContentWidth - scaledWidth) / 2;
+
+          // Calculate X based on alignment
+          let imageX: number;
+          const columnOffsetX = clickedColumn * (columnWidth + columnGap);
+          if (docImage.horizontalAlign === 'center') {
+            imageX = marginLeft + columnOffsetX + (columnWidth - scaledWidth) / 2;
+          } else if (docImage.horizontalAlign === 'right') {
+            imageX = marginLeft + columnOffsetX + columnWidth - scaledWidth;
+          } else {
+            imageX = marginLeft + columnOffsetX;
+          }
 
           // Find the first line of this image
           let firstImageLine = displayLineIndex;
@@ -1277,9 +1718,10 @@
           cursorOffset = paragraphs[cursorPara].length;
         }
       } else {
-        // Calculate character position
+        // Calculate character position (accounting for column offset)
+        const columnOffsetX = clickedColumn * (columnWidth + columnGap);
         let col = 0;
-        let textWidth = marginLeft;
+        let textWidth = marginLeft + columnOffsetX;
 
         for (let i = 0; i <= dl.text.length; i++) {
           const charWidth = i < dl.text.length ? measureTextWidth(dl.text[i]) : 0;
@@ -1337,14 +1779,25 @@
           const mx = e.clientX - r.left;
           const my = e.clientY - r.top;
 
-          const lineInPg = Math.floor((my - marginTop) / scaledLineHeight);
-          const dlIdx = i * linesPerPage + lineInPg;
+          const lineInCol = Math.floor((my - marginTop) / scaledLineHeight);
+
+          // Determine which column was clicked during drag
+          let dragColumn = 0;
+          if (columnCount > 1) {
+            const xInContent = mx - marginLeft;
+            if (xInContent >= columnWidth + columnGap) {
+              dragColumn = 1;
+            }
+          }
+
+          const dlIdx = i * linesPerPage + dragColumn * linesPerColumn + lineInCol;
+          const dragColumnOffsetX = dragColumn * (columnWidth + columnGap);
 
           if (dlIdx >= 0 && dlIdx < displayLines.length) {
             const dl = displayLines[dlIdx];
 
             let col = 0;
-            let tw = marginLeft;
+            let tw = marginLeft + dragColumnOffsetX;
             for (let j = 0; j <= dl.text.length; j++) {
               const cw = j < dl.text.length ? measureTextWidth(dl.text[j]) : 0;
               if (tw + cw / 2 >= mx) {
@@ -1385,6 +1838,9 @@
 
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
+
+    // Update current page
+    currentPage.set(pageIndex + 1);
 
     // Focus immediately on mousedown
     hiddenTextarea?.focus();
@@ -1468,6 +1924,25 @@
         }
         break;
 
+      // Font size for selected paragraphs
+      case 'fontSize':
+        if (value) {
+          const newFontSize = parseInt(value);
+          for (let i = startPara; i <= endPara; i++) {
+            paragraphMeta[i] = { ...paragraphMeta[i], fontSize: newFontSize };
+          }
+        }
+        break;
+
+      // Text color for selected paragraphs
+      case 'foreColor':
+        if (value) {
+          for (let i = startPara; i <= endPara; i++) {
+            paragraphMeta[i] = { ...paragraphMeta[i], textColor: value };
+          }
+        }
+        break;
+
       // Undo/Redo (placeholder - would need history implementation)
       case 'undo':
       case 'redo':
@@ -1483,12 +1958,13 @@
     // Trigger reactivity
     paragraphMeta = [...paragraphMeta];
     recomputeDisplayLines();
+    renderAllPages();
     hiddenTextarea?.focus();
   }
 
   // Image handling functions
   function generateImageId(): string {
-    return 'img-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+    return 'img-' + Date.now() + '-' + Math.random().toString(36).substring(2, 11);
   }
 
   function loadImage(src: string): Promise<HTMLImageElement> {
@@ -1501,7 +1977,7 @@
     });
   }
 
-  async function insertImage(src: string, display: ImageDisplay = 'block') {
+  async function insertImage(src: string, wrapStyle: ImageWrapStyle = 'inline') {
     try {
       const img = await loadImage(src);
       const id = generateImageId();
@@ -1524,7 +2000,9 @@
         height,
         naturalWidth: img.naturalWidth,
         naturalHeight: img.naturalHeight,
-        display,
+        wrapStyle,
+        positionMode: 'move-with-text',
+        horizontalAlign: 'left',
         cropTop: 0,
         cropRight: 0,
         cropBottom: 0,
@@ -1672,16 +2150,59 @@
     renderAllPages();
   }
 
-  function changeImageDisplay(display: ImageDisplay) {
+  function changeImageWrapStyle(wrapStyle: ImageWrapStyle) {
     if (!selectedImageId) return;
 
     const imageIndex = images.findIndex(img => img.id === selectedImageId);
     if (imageIndex === -1) return;
 
-    images[imageIndex] = { ...images[imageIndex], display };
-    images = [...images]; // Trigger reactivity
+    const updatedImage = { ...images[imageIndex], wrapStyle };
 
-    showImageOptionsPopup = false;
+    // Clear absolute position when switching to move-with-text mode
+    if (updatedImage.positionMode === 'move-with-text') {
+      updatedImage.x = undefined;
+      updatedImage.y = undefined;
+      updatedImage.pageIndex = undefined;
+    }
+
+    images[imageIndex] = updatedImage;
+    images = [...images];
+
+    recomputeDisplayLines();
+    renderAllPages();
+  }
+
+  function changeImagePositionMode(positionMode: ImagePositionMode) {
+    if (!selectedImageId) return;
+
+    const imageIndex = images.findIndex(img => img.id === selectedImageId);
+    if (imageIndex === -1) return;
+
+    const updatedImage = { ...images[imageIndex], positionMode };
+
+    // Clear absolute position when switching to move-with-text
+    if (positionMode === 'move-with-text') {
+      updatedImage.x = undefined;
+      updatedImage.y = undefined;
+      updatedImage.pageIndex = undefined;
+    }
+
+    images[imageIndex] = updatedImage;
+    images = [...images];
+
+    recomputeDisplayLines();
+    renderAllPages();
+  }
+
+  function changeImageHorizontalAlign(align: 'left' | 'center' | 'right') {
+    if (!selectedImageId) return;
+
+    const imageIndex = images.findIndex(img => img.id === selectedImageId);
+    if (imageIndex === -1) return;
+
+    images[imageIndex] = { ...images[imageIndex], horizontalAlign: align };
+    images = [...images];
+
     recomputeDisplayLines();
     renderAllPages();
   }
@@ -1695,7 +2216,7 @@
     showImageOptionsPopup = false;
   }
 
-  // Get image bounds for a selected image (accounts for crop)
+  // Get image bounds for a selected image (accounts for crop and absolute positioning)
   function getSelectedImageBounds(): { x: number; y: number; width: number; height: number; pageIndex: number } | null {
     if (!selectedImageId) return null;
 
@@ -1718,6 +2239,18 @@
     const cropAspect = srcW / srcH;
     const destW = scaledWidth;
     const destH = scaledWidth / cropAspect;
+
+    // Check if image has absolute position
+    if (docImage.x !== undefined && docImage.y !== undefined) {
+      const pageHeight = contentDims.height;
+      const imagePageIndex = Math.floor(docImage.y / pageHeight);
+      const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+
+      const imageX = marginLeft + (docImage.x * $zoomLevel) / 100;
+      const imageY = marginTop + (yOnPage * $zoomLevel) / 100;
+
+      return { x: imageX, y: imageY, width: destW, height: destH, pageIndex: imagePageIndex };
+    }
 
     // Find the display line for this image
     const displayLineIdx = displayLines.findIndex(dl => dl.imageId === selectedImageId && dl.isImage);
@@ -1994,6 +2527,78 @@
     renderAllPages();
   }
 
+  // Start dragging an image - all images can be dragged freely
+  function startDrag(clientX: number, clientY: number, _pageIndex: number) {
+    if (!selectedImageId) return;
+
+    const docImage = images.find(img => img.id === selectedImageId);
+    if (!docImage) return;
+
+    isDragging = true;
+    dragStartX = clientX;
+    dragStartY = clientY;
+
+    // Initialize position if not set
+    if (docImage.x === undefined || docImage.y === undefined) {
+      const bounds = getSelectedImageBounds();
+      if (bounds) {
+        // Convert to unscaled coordinates relative to content area
+        dragStartImageX = (bounds.x - marginLeft) * (100 / $zoomLevel);
+        dragStartImageY = bounds.pageIndex * (contentDims.height) + ((bounds.y - marginTop) * (100 / $zoomLevel));
+      } else {
+        dragStartImageX = 0;
+        dragStartImageY = 0;
+      }
+    } else {
+      dragStartImageX = docImage.x;
+      dragStartImageY = docImage.y;
+    }
+
+    showImageOptionsPopup = false;
+  }
+
+  // Handle drag move
+  function handleDragMove(clientX: number, clientY: number) {
+    if (!isDragging || !selectedImageId) return;
+
+    const imageIndex = images.findIndex(img => img.id === selectedImageId);
+    if (imageIndex === -1) return;
+
+    const docImage = images[imageIndex];
+
+    // Calculate delta in unscaled coordinates
+    const deltaX = (clientX - dragStartX) * (100 / $zoomLevel);
+    const deltaY = (clientY - dragStartY) * (100 / $zoomLevel);
+
+    let newX = dragStartImageX + deltaX;
+    let newY = dragStartImageY + deltaY;
+
+    // Constrain to content area
+    const maxX = contentDims.width - docImage.width;
+    newX = Math.max(0, Math.min(maxX, newX));
+
+    // Calculate which page the image is on based on Y position
+    const pageHeight = contentDims.height;
+    const totalY = Math.max(0, newY);
+    const newPageIndex = Math.floor(totalY / pageHeight);
+
+    // Update position - works for all images
+    images[imageIndex] = {
+      ...docImage,
+      x: newX,
+      y: totalY,
+      pageIndex: newPageIndex,
+    };
+    images = [...images];
+    recomputeDisplayLines();
+    renderAllPages();
+  }
+
+  // End dragging
+  function endDrag() {
+    isDragging = false;
+  }
+
   // Generate page array for rendering
   let pageArray = $derived(Array.from({ length: numPages }, (_, i) => i));
 </script>
@@ -2005,15 +2610,14 @@
   <canvas bind:this={measureCanvas} class="measure-canvas"></canvas>
 
   <!-- Hidden textarea for keyboard input -->
+  <!-- svelte-ignore a11y_autocomplete_valid -->
   <textarea
     bind:this={hiddenTextarea}
     class="hidden-input"
     onkeydown={handleKeyDown}
     onpaste={handlePaste}
     autocomplete="off"
-    autocorrect="off"
-    autocapitalize="off"
-    spellcheck="false"
+    spellcheck={false}
   ></textarea>
 
   <div class="editor-container" bind:this={editorContainer}>
@@ -2096,6 +2700,7 @@
 
   <!-- Image options popup -->
   {#if showImageOptionsPopup && selectedImageId && !isCropping}
+    {@const selectedImage = images.find(img => img.id === selectedImageId)}
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div class="image-options-overlay" onclick={closeImageOptionsPopup}>
       <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -2105,66 +2710,192 @@
         onclick={(e) => e.stopPropagation()}
       >
         <div class="image-options-header">
-          <span>Image Options</span>
+          <span>Layout Options</span>
           <button class="popup-close" onclick={closeImageOptionsPopup}>&times;</button>
         </div>
+
+        <!-- In Line with Text -->
         <div class="image-options-section">
-          <div class="section-label">Layout</div>
+          <div class="section-label">In Line with Text</div>
           <div class="image-options-buttons">
             <button
               class="layout-btn"
-              class:active={images.find(img => img.id === selectedImageId)?.display === 'inline'}
-              onclick={() => changeImageDisplay('inline')}
-              title="Inline with text"
+              class:active={selectedImage?.wrapStyle === 'inline'}
+              onclick={() => changeImageWrapStyle('inline')}
+              title="In line with text"
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                <line x1="2" y1="12" x2="8" y2="12" stroke="currentColor" stroke-width="1.5"/>
-                <rect x="9" y="8" width="6" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                <line x1="16" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="8" x2="8" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="9" y="5" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="16" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="14" x2="22" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="18" x2="22" y2="18" stroke="currentColor" stroke-width="1.5"/>
               </svg>
-              <span>Inline</span>
-            </button>
-            <button
-              class="layout-btn"
-              class:active={images.find(img => img.id === selectedImageId)?.display === 'block'}
-              onclick={() => changeImageDisplay('block')}
-              title="Block (centered)"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="4" y="6" width="16" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
-              </svg>
-              <span>Block</span>
-            </button>
-            <button
-              class="layout-btn"
-              class:active={images.find(img => img.id === selectedImageId)?.display === 'float-left'}
-              onclick={() => changeImageDisplay('float-left')}
-              title="Float left (text wraps right)"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="2" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                <line x1="12" y1="6" x2="22" y2="6" stroke="currentColor" stroke-width="1.5"/>
-                <line x1="12" y1="10" x2="22" y2="10" stroke="currentColor" stroke-width="1.5"/>
-                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5"/>
-              </svg>
-              <span>Left</span>
-            </button>
-            <button
-              class="layout-btn"
-              class:active={images.find(img => img.id === selectedImageId)?.display === 'float-right'}
-              onclick={() => changeImageDisplay('float-right')}
-              title="Float right (text wraps left)"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="14" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                <line x1="2" y1="6" x2="12" y2="6" stroke="currentColor" stroke-width="1.5"/>
-                <line x1="2" y1="10" x2="12" y2="10" stroke="currentColor" stroke-width="1.5"/>
-                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5"/>
-              </svg>
-              <span>Right</span>
+              <span>In Line</span>
             </button>
           </div>
         </div>
+
+        <!-- With Text Wrapping -->
+        <div class="image-options-section">
+          <div class="section-label">With Text Wrapping</div>
+          <div class="image-options-buttons wrap-buttons">
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'square'}
+              onclick={() => changeImageWrapStyle('square')}
+              title="Square - text wraps in a square around the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="2" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="12" y1="5" x2="22" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="11" x2="22" y2="11" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="15" x2="22" y2="15" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="19" x2="22" y2="19" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Square</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'tight'}
+              onclick={() => changeImageWrapStyle('tight')}
+              title="Tight - text wraps tightly around the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M3 5 L9 5 L9 11 L3 11 Z" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="11" y1="5" x2="21" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="11" y1="8" x2="21" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="11" y1="11" x2="21" y2="11" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="3" y1="14" x2="21" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="3" y1="18" x2="21" y2="18" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Tight</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'through'}
+              onclick={() => changeImageWrapStyle('through')}
+              title="Through - text flows through the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M4 4 L10 4 L10 10 L4 10 Z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-dasharray="2,1"/>
+                <line x1="12" y1="5" x2="20" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="9" x2="20" y2="9" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="4" y1="14" x2="20" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="4" y1="18" x2="20" y2="18" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Through</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'top-bottom'}
+              onclick={() => changeImageWrapStyle('top-bottom')}
+              title="Top and Bottom - text above and below only"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <line x1="2" y1="4" x2="22" y2="4" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="6" y="8" width="12" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="2" y1="20" x2="22" y2="20" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Top/Bottom</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'behind'}
+              onclick={() => changeImageWrapStyle('behind')}
+              title="Behind Text - image appears behind text"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.5"/>
+                <line x1="2" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Behind</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'in-front'}
+              onclick={() => changeImageWrapStyle('in-front')}
+              title="In Front of Text - image appears in front of text"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <line x1="2" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <line x1="2" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <rect x="6" y="6" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="white"/>
+              </svg>
+              <span>In Front</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Horizontal Alignment (for non-inline modes) -->
+        {#if selectedImage?.wrapStyle !== 'inline'}
+          <div class="image-options-section">
+            <div class="section-label">Horizontal Position</div>
+            <div class="image-options-buttons">
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'left'}
+                onclick={() => changeImageHorizontalAlign('left')}
+                title="Align left"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="2" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'center'}
+                onclick={() => changeImageHorizontalAlign('center')}
+                title="Center"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="7" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'right'}
+                onclick={() => changeImageHorizontalAlign('right')}
+                title="Align right"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="12" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        <!-- Position Mode -->
+        <div class="image-options-section">
+          <div class="section-label">Position</div>
+          <div class="position-radio-group">
+            <label class="radio-option">
+              <input
+                type="radio"
+                name="positionMode"
+                checked={selectedImage?.positionMode === 'move-with-text'}
+                onchange={() => changeImagePositionMode('move-with-text')}
+              />
+              <span>Move with text</span>
+            </label>
+            <label class="radio-option">
+              <input
+                type="radio"
+                name="positionMode"
+                checked={selectedImage?.positionMode === 'fixed-position'}
+                onchange={() => changeImagePositionMode('fixed-position')}
+              />
+              <span>Fix position on page</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Edit Section -->
         <div class="image-options-section">
           <div class="section-label">Edit</div>
           <div class="image-options-buttons">
@@ -2190,6 +2921,7 @@
             </button>
           </div>
         </div>
+
         <button class="delete-image-btn" onclick={deleteSelectedImage}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
             <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
@@ -2535,6 +3267,42 @@
     text-transform: uppercase;
     margin-bottom: 6px;
     padding-left: 4px;
+  }
+
+  .wrap-buttons {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+  }
+
+  .layout-btn.small {
+    padding: 6px 10px;
+  }
+
+  .layout-btn.small svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .position-radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 8px;
+  }
+
+  .radio-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #202124;
+  }
+
+  .radio-option input[type="radio"] {
+    margin: 0;
+    cursor: pointer;
   }
 
   /* Crop mode bar */
