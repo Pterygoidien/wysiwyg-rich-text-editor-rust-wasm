@@ -3,67 +3,29 @@
   import Toolbar from './Toolbar.svelte';
   import { pageConfig, zoomLevel, currentPage, totalPages, fontSize as fontSizeStore, fontFamily as fontFamilyStore, headings, type HeadingItem, lineHeight as lineHeightStore, letterSpacing as letterSpacingStore, paragraphSpacing as paragraphSpacingStore } from './stores';
   import { getContentDimensions, getPageDimensions, getColumnWidth, mmToPixels } from './types';
+  import {
+    type TextAlign,
+    type ListType,
+    type BlockType,
+    type ImageWrapStyle,
+    type ImagePositionMode,
+    type ParagraphMeta,
+    type DocumentImage,
+    type DisplayLine,
+    type FloatImage,
+    type ResizeHandle,
+    IMAGE_MARKER,
+    PAGE_BREAK_MARKER,
+    createDefaultMeta
+  } from './editor';
 
   let editorContainer: HTMLDivElement;
   let canvasContainer: HTMLDivElement;
   let hiddenTextarea: HTMLTextAreaElement;
   let measureCanvas: HTMLCanvasElement;
 
-  // Paragraph metadata type
-  type TextAlign = 'left' | 'center' | 'right' | 'justify';
-  type ListType = 'none' | 'bullet' | 'numbered';
-  type BlockType = 'p' | 'h1' | 'h2' | 'h3' | 'h4' | 'blockquote';
-  // Image layout types (like Word)
-  type ImageWrapStyle =
-    | 'inline'        // In line with text
-    | 'square'        // Square wrapping
-    | 'tight'         // Tight wrapping (same as square for now)
-    | 'through'       // Through (same as square for now)
-    | 'top-bottom'    // Top and bottom (text above and below only)
-    | 'behind'        // Behind text
-    | 'in-front';     // In front of text
-
-  type ImagePositionMode = 'move-with-text' | 'fixed-position';
-
-  interface ParagraphMeta {
-    align: TextAlign;
-    listType: ListType;
-    blockType: BlockType;
-    indent: number;
-    fontSize?: number; // Optional - if not set, uses default or heading size
-    textColor?: string; // Optional - if not set, uses default black
-  }
-
-  interface DocumentImage {
-    id: string;
-    src: string;  // data URL or external URL
-    width: number;
-    height: number;
-    naturalWidth: number;  // Original image width
-    naturalHeight: number; // Original image height
-    wrapStyle: ImageWrapStyle;
-    positionMode: ImagePositionMode;
-    // Horizontal alignment for non-inline images
-    horizontalAlign?: 'left' | 'center' | 'right';
-    // Crop settings (percentages 0-100)
-    cropTop?: number;
-    cropRight?: number;
-    cropBottom?: number;
-    cropLeft?: number;
-    // Absolute positioning (in unscaled pixels, relative to content area)
-    x?: number;  // X position from left margin
-    y?: number;  // Y position from top of document
-    pageIndex?: number; // Which page the image is on
-  }
-
-  // Special marker for image paragraphs
-  const IMAGE_MARKER = '\uFFFC'; // Object replacement character
-  // Special marker for page breaks
-  const PAGE_BREAK_MARKER = '\uFFFD'; // Replacement character for page break
-
-  // Document state - paragraphs are logical units (separated by Enter)
   let paragraphs: string[] = $state(['']);
-  let paragraphMeta: ParagraphMeta[] = $state([{ align: 'left', listType: 'none', blockType: 'p', indent: 0 }]);
+  let paragraphMeta: ParagraphMeta[] = $state([createDefaultMeta()]);
   let images: DocumentImage[] = $state([]);
   let loadedImages: Map<string, HTMLImageElement> = new Map();
 
@@ -86,11 +48,6 @@
   let isItalic = $state(false);
   let isUnderline = $state(false);
   let isStrikethrough = $state(false);
-
-  // Default paragraph meta
-  function getDefaultMeta(): ParagraphMeta {
-    return { align: 'left', listType: 'none', blockType: 'p', indent: 0 };
-  }
 
   // Calculate dimensions
   let pageDims = $derived(getPageDimensions($pageConfig));
@@ -116,21 +73,6 @@
   // Total lines per page (across all columns)
   let linesPerPage = $derived(linesPerColumn * columnCount);
 
-  // Wrapped lines for display - computed from paragraphs
-  interface DisplayLine {
-    paraIndex: number;
-    startOffset: number;
-    endOffset: number;
-    text: string;
-    meta: ParagraphMeta;
-    listNumber?: number; // For numbered lists
-    isImage?: boolean; // Is this an image line?
-    imageId?: string; // Reference to image
-    imageHeight?: number; // Height in display lines
-    floatReduction?: { side: 'left' | 'right'; width: number }; // Text width reduction for floats
-    isPageBreak?: boolean; // Is this a page break marker?
-  }
-
   // Track selected image
   let selectedImageId: string | null = $state(null);
 
@@ -139,7 +81,6 @@
   let imageOptionsPosition = $state({ x: 0, y: 0 });
 
   // Image resize state
-  type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 's' | 'e' | 'w' | null;
   let isResizing = $state(false);
   let resizeHandle: ResizeHandle = $state(null);
   let resizeStartX = $state(0);
@@ -162,52 +103,105 @@
   let dragStartImageX = $state(0);
   let dragStartImageY = $state(0);
 
-  // Float image tracking for text wrapping
-  interface FloatImage {
-    id: string;
-    startLine: number; // Display line where float starts
-    endLine: number;   // Display line where float ends
-    width: number;     // Scaled width
-    side: 'left' | 'right';
-  }
   let activeFloats: FloatImage[] = $state([]);
 
   let displayLines: DisplayLine[] = $state([]);
   let numPages = $derived(Math.max(1, Math.ceil(displayLines.length / linesPerPage)));
 
-  // Canvas refs for each page
   let canvases: HTMLCanvasElement[] = [];
 
-  // Get font style string
+  /**
+   * Composes a CSS font shorthand string from current styling state.
+   * Combines italic, bold, font size, and font family into a single string
+   * suitable for setting the canvas context font property.
+   *
+   * @returns CSS font string (e.g., "italic bold 16px Arial")
+   */
   function getFontStyle(): string {
     return `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : ''}${scaledFontSize}px ${fontFamily}`;
   }
 
-  // Measure text width using the measurement canvas
-  function measureTextWidth(text: string): number {
+  /**
+   * Measures the rendered width of text using the off-screen measurement canvas.
+   * Accounts for letter spacing by adding the configured spacing between characters.
+   * Falls back to an estimated width if the canvas is unavailable.
+   *
+   * @param text - The text string to measure
+   * @param meta - Optional paragraph metadata for font size/style overrides
+   * @returns Width in pixels
+   */
+  function measureTextWidth(text: string, meta?: ParagraphMeta): number {
     if (!measureCanvas) return text.length * scaledFontSize * 0.5;
     const ctx = measureCanvas.getContext('2d');
     if (!ctx) return text.length * scaledFontSize * 0.5;
-    ctx.font = getFontStyle();
+
+    let effectiveFontSize = scaledFontSize;
+    let fontWeight = isBold ? 'bold ' : '';
+    let fontStyle = isItalic ? 'italic ' : '';
+
+    if (meta) {
+      const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+      switch (meta.blockType) {
+        case 'h1':
+          effectiveFontSize = baseFontSize * 2;
+          fontWeight = 'bold ';
+          break;
+        case 'h2':
+          effectiveFontSize = baseFontSize * 1.5;
+          fontWeight = 'bold ';
+          break;
+        case 'h3':
+          effectiveFontSize = baseFontSize * 1.17;
+          fontWeight = 'bold ';
+          break;
+        case 'h4':
+          effectiveFontSize = baseFontSize;
+          fontWeight = 'bold ';
+          break;
+        case 'blockquote':
+          effectiveFontSize = baseFontSize;
+          fontStyle = 'italic ';
+          break;
+        default:
+          effectiveFontSize = baseFontSize;
+      }
+    }
+
+    ctx.font = `${fontStyle}${fontWeight}${effectiveFontSize}px ${fontFamily}`;
     const baseWidth = ctx.measureText(text).width;
-    // Add letter spacing for each character (except after last)
     const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
     return baseWidth + (text.length > 0 ? (text.length - 1) * scaledLetterSpacing : 0);
   }
 
-  // Wrap a single paragraph into display lines
+  /**
+   * Wraps a paragraph into multiple display lines that fit within the content width.
+   * Implements a greedy line-breaking algorithm that prefers word boundaries.
+   * Handles list indentation and float width reductions for text wrapping around images.
+   *
+   * @param paraIndex - Index of the paragraph in the document
+   * @param text - The paragraph text content
+   * @param listNumber - Optional sequence number for numbered lists
+   * @param floatReduction - Optional width reduction for floating images
+   * @returns Array of DisplayLine objects representing wrapped lines
+   */
   function wrapParagraph(
     paraIndex: number,
     text: string,
     listNumber?: number,
     floatReduction?: { side: 'left' | 'right'; width: number }
   ): DisplayLine[] {
-    const meta = paragraphMeta[paraIndex] || getDefaultMeta();
+    const meta = paragraphMeta[paraIndex] || createDefaultMeta();
 
-    // Calculate effective content width (account for list indent, float, and columns)
-    const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
-    const floatWidth = floatReduction ? floatReduction.width + 10 : 0; // 10px gap
-    // Use column width instead of full content width when in multi-column mode
+    const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+    let effectiveFontSize = baseFontSize;
+    switch (meta.blockType) {
+      case 'h1': effectiveFontSize = baseFontSize * 2; break;
+      case 'h2': effectiveFontSize = baseFontSize * 1.5; break;
+      case 'h3': effectiveFontSize = baseFontSize * 1.17; break;
+    }
+
+    const listIndent = meta.listType !== 'none' ? effectiveFontSize * 1.5 : 0;
+    const floatWidth = floatReduction ? floatReduction.width + 10 : 0;
     const baseContentWidth = columnWidth > 0 ? columnWidth : (scaledContentWidth > 0 ? scaledContentWidth : 500);
     const contentWidth = baseContentWidth - listIndent - floatWidth;
 
@@ -219,9 +213,8 @@
     let currentStart = 0;
 
     while (currentStart < text.length) {
-      // First check if the entire remaining text fits
       const remainingText = text.substring(currentStart);
-      if (measureTextWidth(remainingText) <= contentWidth) {
+      if (measureTextWidth(remainingText, meta) <= contentWidth) {
         result.push({
           paraIndex,
           startOffset: currentStart,
@@ -234,13 +227,12 @@
         break;
       }
 
-      // Find the break point by progressively measuring
       let lineEnd = currentStart;
       let lastWordBoundary = currentStart;
 
       for (let i = currentStart + 1; i <= text.length; i++) {
         const testText = text.substring(currentStart, i);
-        const width = measureTextWidth(testText);
+        const width = measureTextWidth(testText, meta);
 
         // Track word boundaries (position after space)
         if (i > currentStart && text[i - 1] === ' ') {
@@ -288,7 +280,19 @@
     return result;
   }
 
-  // Recompute all display lines from paragraphs
+  /**
+   * Recomputes all display lines from the document paragraphs.
+   *
+   * This is the core layout function that transforms the logical paragraph structure
+   * into renderable display lines. It handles:
+   * - Text wrapping within column widths
+   * - Floating image positioning and text flow
+   * - Page break markers
+   * - Numbered list sequencing
+   * - Paragraph spacing markers
+   *
+   * Called whenever content or layout parameters change.
+   */
   function recomputeDisplayLines() {
     const newDisplayLines: DisplayLine[] = [];
     const newActiveFloats: FloatImage[] = [];
@@ -341,7 +345,7 @@
     }
 
     for (let i = 0; i < paragraphs.length; i++) {
-      const meta = paragraphMeta[i] || getDefaultMeta();
+      const meta = paragraphMeta[i] || createDefaultMeta();
       const paraText = paragraphs[i];
 
       // Check if this is a page break
@@ -545,10 +549,8 @@
         }
       }
 
-      // Wrap the paragraph with float consideration
       const wrapped = wrapParagraph(i, paraText, listNumber, floatReduction);
 
-      // For each wrapped line, check if float still applies
       for (let j = 0; j < wrapped.length; j++) {
         const lineIdx = newDisplayLines.length;
         let lineFloatReduction: { side: 'left' | 'right'; width: number } | undefined;
@@ -560,9 +562,10 @@
           }
         }
 
-        // If float changed, we need to re-wrap from this point
-        // For simplicity, we'll just tag lines with their float reduction
         wrapped[j].floatReduction = lineFloatReduction;
+        if (j === wrapped.length - 1) {
+          wrapped[j].isLastLineOfParagraph = true;
+        }
         newDisplayLines.push(wrapped[j]);
       }
     }
@@ -575,11 +578,15 @@
     updateHeadings();
   }
 
-  // Extract headings from paragraphs and update the store
+  /**
+   * Extracts heading paragraphs and updates the navigation store.
+   * Scans all paragraphs for heading block types (h1-h4) and builds
+   * a hierarchical structure for the document outline sidebar.
+   */
   function updateHeadings() {
     const newHeadings: HeadingItem[] = [];
     for (let i = 0; i < paragraphs.length; i++) {
-      const meta = paragraphMeta[i] || getDefaultMeta();
+      const meta = paragraphMeta[i] || createDefaultMeta();
       const blockType = meta.blockType;
       if (blockType.startsWith('h')) {
         const level = parseInt(blockType[1]);
@@ -596,7 +603,14 @@
     headings.set(newHeadings);
   }
 
-  // Convert paragraph position to display line position
+  /**
+   * Converts a paragraph position to a display line position.
+   * Used for mapping cursor/selection positions to rendered coordinates.
+   *
+   * @param para - Paragraph index in the document
+   * @param offset - Character offset within the paragraph
+   * @returns Display line index and column offset
+   */
   function paraToDisplayPos(para: number, offset: number): { line: number; col: number } {
     for (let i = 0; i < displayLines.length; i++) {
       const dl = displayLines[i];
@@ -604,12 +618,18 @@
         return { line: i, col: offset - dl.startOffset };
       }
     }
-    // Fallback: last position
     const lastLine = displayLines.length - 1;
     return { line: lastLine, col: displayLines[lastLine]?.text.length || 0 };
   }
 
-  // Convert display line position to paragraph position
+  /**
+   * Converts a display line position to a paragraph position.
+   * Used for mapping click coordinates back to document positions.
+   *
+   * @param line - Display line index
+   * @param col - Column offset within the display line
+   * @returns Paragraph index and character offset
+   */
   function displayToPara(line: number, col: number): { para: number; offset: number } {
     if (line < 0 || line >= displayLines.length) {
       return { para: paragraphs.length - 1, offset: paragraphs[paragraphs.length - 1].length };
@@ -618,7 +638,13 @@
     return { para: dl.paraIndex, offset: dl.startOffset + Math.min(col, dl.text.length) };
   }
 
-  // Navigate to a specific paragraph (for sidebar navigation)
+  /**
+   * Navigates the cursor to a specific paragraph.
+   * Used by the document outline sidebar for heading navigation.
+   * Scrolls the view to show the target paragraph and focuses the editor.
+   *
+   * @param paraIndex - Target paragraph index
+   */
   export function navigateToParagraph(paraIndex: number) {
     if (paraIndex < 0 || paraIndex >= paragraphs.length) return;
 
@@ -702,7 +728,18 @@
     }
   });
 
-  // Helper function to render a single image
+  /**
+   * Renders a single image onto the canvas.
+   * Handles cropping, opacity for behind-text images, selection highlighting,
+   * resize handles, and drag/crop mode indicators.
+   *
+   * @param ctx - Canvas 2D rendering context
+   * @param docImage - Document image metadata
+   * @param img - Loaded HTMLImageElement
+   * @param imageX - X coordinate for image placement
+   * @param imageY - Y coordinate for image placement
+   * @param pageIndex - Current page being rendered
+   */
   function renderImage(
     ctx: CanvasRenderingContext2D,
     docImage: DocumentImage,
@@ -784,7 +821,17 @@
     }
   }
 
-  // Helper to calculate image position
+  /**
+   * Calculates the position of an image on a specific page.
+   * Handles both absolute positioning (dragged images) and line-based positioning.
+   * Accounts for multi-column layouts and horizontal alignment settings.
+   *
+   * @param docImage - Document image metadata
+   * @param displayLineIdx - Display line where the image anchor is located
+   * @param pageIndex - Page being rendered
+   * @param startLine - First display line on the current page
+   * @returns Position coordinates and visibility flag
+   */
   function getImagePosition(
     docImage: DocumentImage,
     displayLineIdx: number,
@@ -792,9 +839,12 @@
     startLine: number
   ): { x: number; y: number; visible: boolean } {
     const scaledWidth = (docImage.width * $zoomLevel) / 100;
+    const dl = displayLines[displayLineIdx];
+    const isInline = docImage.wrapStyle === 'inline';
 
-    // Check if image has absolute position (has been dragged)
-    if (docImage.x !== undefined && docImage.y !== undefined) {
+    // For inline images, ignore absolute positioning - they follow text alignment
+    // For other wrap styles, check if image has absolute position (has been dragged)
+    if (!isInline && docImage.x !== undefined && docImage.y !== undefined) {
       const pageHeight = contentDims.height;
       const imagePageIndex = Math.floor(docImage.y / pageHeight);
 
@@ -820,11 +870,30 @@
 
     const imageY = marginTop + lineInCol * scaledLineHeight;
 
-    // Calculate X position based on horizontal alignment
+    // Calculate X position based on alignment
+    // For inline images, use paragraph's text alignment
+    // For other images, use image's horizontalAlign property
     let imageX: number;
-    if (docImage.horizontalAlign === 'center') {
+    let alignment: 'left' | 'center' | 'right';
+
+    if (isInline && dl?.meta) {
+      // Inline images follow the paragraph's text alignment
+      const textAlign = dl.meta.align;
+      if (textAlign === 'center') {
+        alignment = 'center';
+      } else if (textAlign === 'right') {
+        alignment = 'right';
+      } else {
+        alignment = 'left';
+      }
+    } else {
+      // Other image types use their own horizontalAlign property
+      alignment = docImage.horizontalAlign || 'left';
+    }
+
+    if (alignment === 'center') {
       imageX = marginLeft + columnOffsetX + (columnWidth - scaledWidth) / 2;
-    } else if (docImage.horizontalAlign === 'right') {
+    } else if (alignment === 'right') {
       imageX = marginLeft + columnOffsetX + columnWidth - scaledWidth;
     } else {
       imageX = marginLeft + columnOffsetX;
@@ -833,6 +902,21 @@
     return { x: imageX, y: imageY, visible: true };
   }
 
+  /**
+   * Renders all pages of the document.
+   *
+   * This is the main rendering function that draws the complete document.
+   * It processes each page in sequence, rendering in multiple passes:
+   * 1. Behind-text images (wrapStyle: 'behind')
+   * 2. Floating images with text wrapping
+   * 3. Inline and top-bottom images
+   * 4. Text content with formatting, selection, and cursor
+   * 5. In-front images (wrapStyle: 'in-front')
+   * 6. Page numbers
+   *
+   * The function handles paragraph spacing, multi-column layouts,
+   * text alignment, list markers, and block-level styling.
+   */
   function renderAllPages() {
     const pageCount = numPages;
 
@@ -966,15 +1050,22 @@
       }
 
       // === PASS 4: Render text ===
+      const scaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
+      let cumulativeSpacing = 0;
+
       for (let i = startLine; i < endLine; i++) {
         const lineIndexOnPage = i - startLine;
         const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
         const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
         const columnOffsetX = colIndex * (columnWidth + columnGap);
-        const y = marginTop + lineInColumn * scaledLineHeight;
-        const dl = displayLines[i];
 
-        // Skip image lines and page break lines
+        const dl = displayLines[i];
+        const y = marginTop + lineInColumn * scaledLineHeight + cumulativeSpacing;
+
+        if (dl.isLastLineOfParagraph) {
+          cumulativeSpacing += scaledParagraphSpacing;
+        }
+
         if (dl.isImage || dl.isPageBreak) continue;
 
         const text = dl.text;
@@ -1148,6 +1239,7 @@
           ctx.fillStyle = '#000';
           ctx.fillRect(cursorX, y + 2, 2, scaledLineHeight - 4);
         }
+
       }
 
       // === PASS 5: Render "in-front" images last (after text) ===
@@ -1176,10 +1268,24 @@
     }
   }
 
+  /**
+   * Handles keyboard events for the editor.
+   *
+   * Processes all keyboard input including:
+   * - Text input and deletion
+   * - Navigation (arrows, Home, End, Page Up/Down)
+   * - Selection (Shift+arrows, Ctrl+A)
+   * - Clipboard operations (Ctrl+C/X/V)
+   * - Formatting shortcuts (Ctrl+B/I/U)
+   * - Special characters (Tab for indent)
+   * - Page breaks (Alt+Enter)
+   * - Image operations (Delete/Backspace when image selected)
+   *
+   * @param event - The keyboard event to process
+   */
   function handleKeyDown(event: KeyboardEvent) {
     const key = event.key;
 
-    // Handle image deletion
     if (selectedImageId && (key === 'Delete' || key === 'Backspace')) {
       event.preventDefault();
       deleteSelectedImage();
@@ -1372,7 +1478,7 @@
           paragraphs[cursorPara] = before;
           paragraphs = [...paragraphs.slice(0, cursorPara + 1), after, ...paragraphs.slice(cursorPara + 1)];
           // Copy current paragraph's metadata to new paragraph
-          const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+          const currentMeta = paragraphMeta[cursorPara] || createDefaultMeta();
           // Reset block type to normal 'p' for new line after headings
           const newBlockType = currentMeta.blockType.startsWith('h') ? 'p' : currentMeta.blockType;
           paragraphMeta = [
@@ -1417,7 +1523,7 @@
     } else {
       const before = paragraphs[cursorPara].substring(0, cursorOffset);
       const after = paragraphs[cursorPara].substring(cursorOffset);
-      const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+      const currentMeta = paragraphMeta[cursorPara] || createDefaultMeta();
 
       paragraphs[cursorPara] = before + lines[0];
 
@@ -1467,10 +1573,10 @@
     ];
 
     // Add metadata for new paragraphs
-    const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+    const currentMeta = paragraphMeta[cursorPara] || createDefaultMeta();
     paragraphMeta = [
       ...paragraphMeta.slice(0, cursorPara + 1),
-      { ...getDefaultMeta() }, // Page break meta (not really used)
+      { ...createDefaultMeta() }, // Page break meta (not really used)
       { ...currentMeta }, // After text meta
       ...paragraphMeta.slice(cursorPara + 1)
     ];
@@ -1580,9 +1686,6 @@
       }
     }
 
-    // Calculate which display line was clicked (accounting for columns)
-    const lineInColumn = Math.floor((y - marginTop) / scaledLineHeight);
-
     // Determine which column was clicked
     let clickedColumn = 0;
     if (columnCount > 1) {
@@ -1592,8 +1695,45 @@
       }
     }
 
-    // Calculate display line index: (page * linesPerPage) + (column * linesPerColumn) + lineInColumn
-    const displayLineIndex = pageIndex * linesPerPage + clickedColumn * linesPerColumn + lineInColumn;
+    // Calculate display line index accounting for paragraph spacing
+    const startLine = pageIndex * linesPerPage;
+    const endLine = Math.min(startLine + linesPerPage, displayLines.length);
+    const scaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
+    const yInContent = y - marginTop;
+
+    let displayLineIndex = -1;
+    let cumulativeSpacing = 0;
+
+    for (let i = startLine; i < endLine; i++) {
+      const lineIndexOnPage = i - startLine;
+      const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
+
+      if (colIndex !== clickedColumn) {
+        const dl = displayLines[i];
+        if (dl && dl.isLastLineOfParagraph) {
+          cumulativeSpacing += scaledParagraphSpacing;
+        }
+        continue;
+      }
+
+      const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
+      const lineY = lineInColumn * scaledLineHeight + cumulativeSpacing;
+      const lineBottom = lineY + scaledLineHeight;
+
+      if (yInContent >= lineY && yInContent < lineBottom) {
+        displayLineIndex = i;
+        break;
+      }
+
+      const dl = displayLines[i];
+      if (dl && dl.isLastLineOfParagraph) {
+        cumulativeSpacing += scaledParagraphSpacing;
+      }
+    }
+
+    if (displayLineIndex === -1 && yInContent >= 0) {
+      displayLineIndex = endLine - 1;
+    }
 
     // Check if clicked on a float image first
     for (const float of activeFloats) {
@@ -1718,18 +1858,52 @@
           cursorOffset = paragraphs[cursorPara].length;
         }
       } else {
-        // Calculate character position (accounting for column offset)
         const columnOffsetX = clickedColumn * (columnWidth + columnGap);
+        const meta = dl.meta;
+
+        const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
+        const floatOffset = dl.floatReduction && dl.floatReduction.side === 'left' ? dl.floatReduction.width + 10 : 0;
+        const textStartX = marginLeft + columnOffsetX + listIndent + floatOffset;
+
+        const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+        let blockFontSize = baseFontSize;
+        switch (meta.blockType) {
+          case 'h1': blockFontSize = baseFontSize * 2; break;
+          case 'h2': blockFontSize = baseFontSize * 1.5; break;
+          case 'h3': blockFontSize = baseFontSize * 1.17; break;
+        }
+
+        const floatWidthReduction = dl.floatReduction ? dl.floatReduction.width + 10 : 0;
+        const availableWidth = columnWidth - listIndent - floatWidthReduction;
+
+        const measureCtx = measureCanvas?.getContext('2d');
+        if (measureCtx) {
+          const blockFontWeight = ['h1', 'h2', 'h3', 'h4'].includes(meta.blockType) ? 'bold ' : (isBold ? 'bold ' : '');
+          const blockFontStyle = meta.blockType === 'blockquote' ? 'italic ' : (isItalic ? 'italic ' : '');
+          measureCtx.font = `${blockFontStyle}${blockFontWeight}${blockFontSize}px ${fontFamily}`;
+        }
+
+        const textWidth = measureCtx ? measureCtx.measureText(dl.text).width : dl.text.length * blockFontSize * 0.5;
+
+        let lineStartX = textStartX;
+        if (meta.align === 'center') {
+          lineStartX = textStartX + (availableWidth - textWidth) / 2;
+        } else if (meta.align === 'right') {
+          lineStartX = textStartX + availableWidth - textWidth;
+        }
+
         let col = 0;
-        let textWidth = marginLeft + columnOffsetX;
+        let currentX = lineStartX;
 
         for (let i = 0; i <= dl.text.length; i++) {
-          const charWidth = i < dl.text.length ? measureTextWidth(dl.text[i]) : 0;
-          if (textWidth + charWidth / 2 >= x) {
+          const charWidth = i < dl.text.length && measureCtx
+            ? measureCtx.measureText(dl.text[i]).width
+            : 0;
+          if (currentX + charWidth / 2 >= x) {
             col = i;
             break;
           }
-          textWidth += charWidth;
+          currentX += charWidth;
           col = i + 1;
         }
 
@@ -1779,9 +1953,6 @@
           const mx = e.clientX - r.left;
           const my = e.clientY - r.top;
 
-          const lineInCol = Math.floor((my - marginTop) / scaledLineHeight);
-
-          // Determine which column was clicked during drag
           let dragColumn = 0;
           if (columnCount > 1) {
             const xInContent = mx - marginLeft;
@@ -1790,21 +1961,94 @@
             }
           }
 
-          const dlIdx = i * linesPerPage + dragColumn * linesPerColumn + lineInCol;
+          const dragStartLine = i * linesPerPage;
+          const dragEndLine = Math.min(dragStartLine + linesPerPage, displayLines.length);
+          const dragScaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
+          const yInContent = my - marginTop;
+
+          let dlIdx = -1;
+          let dragCumulativeSpacing = 0;
+
+          for (let li = dragStartLine; li < dragEndLine; li++) {
+            const lineIndexOnPage = li - dragStartLine;
+            const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
+
+            if (colIndex !== dragColumn) {
+              const dl = displayLines[li];
+              if (dl && dl.isLastLineOfParagraph) {
+                dragCumulativeSpacing += dragScaledParagraphSpacing;
+              }
+              continue;
+            }
+
+            const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
+            const lineY = lineInColumn * scaledLineHeight + dragCumulativeSpacing;
+            const lineBottom = lineY + scaledLineHeight;
+
+            if (yInContent >= lineY && yInContent < lineBottom) {
+              dlIdx = li;
+              break;
+            }
+
+            const dl = displayLines[li];
+            if (dl && dl.isLastLineOfParagraph) {
+              dragCumulativeSpacing += dragScaledParagraphSpacing;
+            }
+          }
+
+          if (dlIdx === -1 && yInContent >= 0) {
+            dlIdx = dragEndLine - 1;
+          }
+
           const dragColumnOffsetX = dragColumn * (columnWidth + columnGap);
 
           if (dlIdx >= 0 && dlIdx < displayLines.length) {
             const dl = displayLines[dlIdx];
+            const meta = dl.meta;
+
+            const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
+            const floatOffset = dl.floatReduction && dl.floatReduction.side === 'left' ? dl.floatReduction.width + 10 : 0;
+            const textStartX = marginLeft + dragColumnOffsetX + listIndent + floatOffset;
+
+            const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+            let blockFontSize = baseFontSize;
+            switch (meta.blockType) {
+              case 'h1': blockFontSize = baseFontSize * 2; break;
+              case 'h2': blockFontSize = baseFontSize * 1.5; break;
+              case 'h3': blockFontSize = baseFontSize * 1.17; break;
+            }
+
+            const floatWidthReduction = dl.floatReduction ? dl.floatReduction.width + 10 : 0;
+            const availableWidth = columnWidth - listIndent - floatWidthReduction;
+
+            const measureCtx = measureCanvas?.getContext('2d');
+            if (measureCtx) {
+              const blockFontWeight = ['h1', 'h2', 'h3', 'h4'].includes(meta.blockType) ? 'bold ' : (isBold ? 'bold ' : '');
+              const blockFontStyle = meta.blockType === 'blockquote' ? 'italic ' : (isItalic ? 'italic ' : '');
+              measureCtx.font = `${blockFontStyle}${blockFontWeight}${blockFontSize}px ${fontFamily}`;
+            }
+
+            const textWidth = measureCtx ? measureCtx.measureText(dl.text).width : dl.text.length * blockFontSize * 0.5;
+
+            let lineStartX = textStartX;
+            if (meta.align === 'center') {
+              lineStartX = textStartX + (availableWidth - textWidth) / 2;
+            } else if (meta.align === 'right') {
+              lineStartX = textStartX + availableWidth - textWidth;
+            }
 
             let col = 0;
-            let tw = marginLeft + dragColumnOffsetX;
+            let currentX = lineStartX;
+
             for (let j = 0; j <= dl.text.length; j++) {
-              const cw = j < dl.text.length ? measureTextWidth(dl.text[j]) : 0;
-              if (tw + cw / 2 >= mx) {
+              const cw = j < dl.text.length && measureCtx
+                ? measureCtx.measureText(dl.text[j]).width
+                : 0;
+              if (currentX + cw / 2 >= mx) {
                 col = j;
                 break;
               }
-              tw += cw;
+              currentX += cw;
               col = j + 1;
             }
             col = Math.min(col, dl.text.length);
@@ -1842,14 +2086,26 @@
     // Update current page
     currentPage.set(pageIndex + 1);
 
-    // Focus immediately on mousedown
     hiddenTextarea?.focus();
-    // Render to show cursor position change
     renderAllPages();
   }
 
+  /**
+   * Handles formatting commands from the toolbar.
+   *
+   * Applies formatting to the current selection or cursor position.
+   * Supports multiple command types:
+   * - Text styling: bold, italic, underline, strikeThrough
+   * - Alignment: justifyLeft, justifyCenter, justifyRight, justifyFull
+   * - Lists: insertUnorderedList, insertOrderedList
+   * - Block types: heading (h1-h4), blockquote
+   * - Indentation: indent, outdent
+   * - Font: fontSize, foreColor
+   *
+   * @param command - The formatting command to execute
+   * @param value - Optional value for commands that require it (e.g., fontSize)
+   */
   function handleFormat(command: string, value?: string) {
-    // Get selected paragraph range
     let startPara = cursorPara;
     let endPara = cursorPara;
     if (selectionStart && selectionEnd) {
@@ -2030,10 +2286,10 @@
       ];
 
       // Add metadata for new paragraphs
-      const currentMeta = paragraphMeta[cursorPara] || getDefaultMeta();
+      const currentMeta = paragraphMeta[cursorPara] || createDefaultMeta();
       paragraphMeta = [
         ...paragraphMeta.slice(0, cursorPara + 1),
-        { ...getDefaultMeta(), align: 'center' }, // Image meta
+        { ...createDefaultMeta(), align: 'center' }, // Image meta
         { ...currentMeta }, // After text meta
         ...paragraphMeta.slice(cursorPara + 1)
       ];
@@ -2133,7 +2389,7 @@
     // Ensure we have at least one paragraph
     if (paragraphs.length === 0) {
       paragraphs = [''];
-      paragraphMeta = [getDefaultMeta()];
+      paragraphMeta = [createDefaultMeta()];
     }
 
     // Adjust cursor position if needed
