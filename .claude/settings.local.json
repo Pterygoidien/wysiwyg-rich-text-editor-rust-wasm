@@ -8,7 +8,9 @@
       "Bash(npm run dev:*)",
       "Bash(timeout:*)",
       "Bash(npx tsc:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(dir /s /b \"c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\")",
+      "Bash(findstr:*)"
     ]
   }
 }
