@@ -689,26 +689,35 @@ fn compute_table_layout(
     let font_size = config.font_size;
     let cell_padding = 8.0; // 4px on each side
     let border = table.border_width;
+    let num_cols = table.column_widths.len();
+
+    // Total border width used by all vertical borders
+    let total_border_width = (num_cols + 1) as f64 * border;
+
+    // Width available for cell content (total minus borders)
+    let content_width = available_width - total_border_width;
 
     // 1. Calculate column widths based on mode
     let column_widths: Vec<f64> = match table.width_mode {
         TableWidthMode::Fixed => table.column_widths.clone(),
         TableWidthMode::Percentage => {
+            // Distribute content_width according to percentages
             table.column_widths
                 .iter()
-                .map(|w| available_width * w / 100.0)
+                .map(|w| content_width * w / 100.0)
                 .collect()
         }
         TableWidthMode::Auto => {
             // For now, use percentage mode for auto too
             table.column_widths
                 .iter()
-                .map(|w| available_width * w / 100.0)
+                .map(|w| content_width * w / 100.0)
                 .collect()
         }
     };
 
     // 2. Calculate cell text layouts and row heights
+    // First pass: calculate base row heights without considering row spans
     let mut row_heights: Vec<f64> = Vec::new();
     let mut cell_lines: Vec<Vec<Vec<String>>> = Vec::new();
 
@@ -717,11 +726,30 @@ fn compute_table_layout(
         let mut max_lines = 1;
 
         for (col_idx, cell) in row.cells.iter().enumerate() {
-            let cell_width = column_widths.get(col_idx).copied().unwrap_or(100.0) - cell_padding;
+            // Skip covered cells - they don't contribute to row height calculation
+            if cell.covered {
+                row_cell_lines.push(vec![String::new()]);
+                continue;
+            }
+
+            // Calculate the width of this cell (accounting for col_span)
+            let mut cell_content_width = 0.0;
+            for span_col in col_idx..(col_idx + cell.col_span).min(num_cols) {
+                cell_content_width += column_widths.get(span_col).copied().unwrap_or(0.0);
+            }
+            // Add border widths between spanned columns
+            if cell.col_span > 1 {
+                cell_content_width += (cell.col_span - 1) as f64 * border;
+            }
+            cell_content_width -= cell_padding;
 
             // Wrap cell text
-            let lines = wrap_text_for_cell(&cell.text, cell_width, font_size, measure_fn, config);
-            max_lines = max_lines.max(lines.len());
+            let lines = wrap_text_for_cell(&cell.text, cell_content_width, font_size, measure_fn, config);
+
+            // Only count lines for row height if this cell doesn't span multiple rows
+            if cell.row_span == 1 {
+                max_lines = max_lines.max(lines.len());
+            }
             row_cell_lines.push(lines);
         }
 
@@ -733,9 +761,40 @@ fn compute_table_layout(
         cell_lines.push(row_cell_lines);
     }
 
-    // 3. Calculate totals
+    // Second pass: adjust row heights for cells with row spans
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        for (col_idx, cell) in row.cells.iter().enumerate() {
+            if cell.covered || cell.row_span <= 1 {
+                continue;
+            }
+
+            // Calculate required height for this spanning cell
+            let lines_count = cell_lines.get(row_idx)
+                .and_then(|r| r.get(col_idx))
+                .map(|l| l.len())
+                .unwrap_or(1);
+            let required_height = lines_count as f64 * line_height + cell_padding;
+
+            // Calculate current total height of spanned rows
+            let spanned_rows_end = (row_idx + cell.row_span).min(table.rows.len());
+            let current_height: f64 = row_heights[row_idx..spanned_rows_end].iter().sum();
+            let border_height = (cell.row_span - 1) as f64 * border;
+            let current_total = current_height + border_height;
+
+            // If required height > current total, distribute extra height
+            if required_height > current_total {
+                let extra = required_height - current_total;
+                let extra_per_row = extra / cell.row_span as f64;
+                for r in row_idx..spanned_rows_end {
+                    row_heights[r] += extra_per_row;
+                }
+            }
+        }
+    }
+
+    // 3. Calculate totals - table should span full available width
     let total_height = row_heights.iter().sum::<f64>() + (table.rows.len() + 1) as f64 * border;
-    let total_width = column_widths.iter().sum::<f64>() + (column_widths.len() + 1) as f64 * border;
+    let total_width = available_width; // Full column width
 
     TableLayout {
         table_id: table.id.clone(),

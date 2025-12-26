@@ -554,6 +554,15 @@ pub struct TableCell {
     /// Row span (default 1)
     #[serde(default = "default_span")]
     pub row_span: usize,
+    /// Whether this cell is covered by a merged cell (not rendered)
+    #[serde(default)]
+    pub covered: bool,
+    /// If covered, the row of the cell that covers this one
+    #[serde(default)]
+    pub covered_by_row: Option<usize>,
+    /// If covered, the column of the cell that covers this one
+    #[serde(default)]
+    pub covered_by_col: Option<usize>,
 }
 
 fn default_span() -> usize {
@@ -569,6 +578,9 @@ impl TableCell {
             background: None,
             col_span: 1,
             row_span: 1,
+            covered: false,
+            covered_by_row: None,
+            covered_by_col: None,
         }
     }
 
@@ -580,7 +592,30 @@ impl TableCell {
             background: None,
             col_span: 1,
             row_span: 1,
+            covered: false,
+            covered_by_row: None,
+            covered_by_col: None,
         }
+    }
+
+    /// Create a covered cell (part of a merged cell region)
+    pub fn covered(covered_by_row: usize, covered_by_col: usize) -> Self {
+        TableCell {
+            text: String::new(),
+            styles: Vec::new(),
+            align: TextAlign::Left,
+            background: None,
+            col_span: 1,
+            row_span: 1,
+            covered: true,
+            covered_by_row: Some(covered_by_row),
+            covered_by_col: Some(covered_by_col),
+        }
+    }
+
+    /// Check if this cell is the origin of a merged region
+    pub fn is_merge_origin(&self) -> bool {
+        !self.covered && (self.col_span > 1 || self.row_span > 1)
     }
 }
 
@@ -729,6 +764,164 @@ impl DocumentTable {
                 *w = *w / total * 100.0;
             }
             true
+        } else {
+            false
+        }
+    }
+
+    /// Merge cells in a rectangular region
+    /// Returns true if merge was successful
+    pub fn merge_cells(
+        &mut self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> bool {
+        // Validate bounds
+        if end_row >= self.num_rows() || end_col >= self.num_cols() {
+            return false;
+        }
+        if start_row > end_row || start_col > end_col {
+            return false;
+        }
+
+        // Check if this is a valid merge (no cells already covered by other merges)
+        for row_idx in start_row..=end_row {
+            for col_idx in start_col..=end_col {
+                if let Some(cell) = self.get_cell(row_idx, col_idx) {
+                    // If cell is covered by a merge outside our range, invalid
+                    if cell.covered {
+                        if let (Some(by_row), Some(by_col)) = (cell.covered_by_row, cell.covered_by_col) {
+                            if by_row < start_row || by_col < start_col {
+                                return false;
+                            }
+                        }
+                    }
+                    // If cell is a merge origin that extends outside our range, invalid
+                    if cell.is_merge_origin() {
+                        let cell_end_row = row_idx + cell.row_span - 1;
+                        let cell_end_col = col_idx + cell.col_span - 1;
+                        if cell_end_row > end_row || cell_end_col > end_col {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect text from all cells being merged (only non-covered cells)
+        let mut combined_text = String::new();
+        for row_idx in start_row..=end_row {
+            for col_idx in start_col..=end_col {
+                if let Some(cell) = self.get_cell(row_idx, col_idx) {
+                    if !cell.covered && !cell.text.is_empty() {
+                        if !combined_text.is_empty() {
+                            combined_text.push('\n');
+                        }
+                        combined_text.push_str(&cell.text);
+                    }
+                }
+            }
+        }
+
+        // Calculate span sizes
+        let row_span = end_row - start_row + 1;
+        let col_span = end_col - start_col + 1;
+
+        // Update the origin cell (top-left)
+        if let Some(origin) = self.get_cell_mut(start_row, start_col) {
+            origin.text = combined_text;
+            origin.row_span = row_span;
+            origin.col_span = col_span;
+            origin.covered = false;
+            origin.covered_by_row = None;
+            origin.covered_by_col = None;
+        }
+
+        // Mark all other cells in the region as covered
+        for row_idx in start_row..=end_row {
+            for col_idx in start_col..=end_col {
+                if row_idx == start_row && col_idx == start_col {
+                    continue; // Skip origin cell
+                }
+                if let Some(cell) = self.get_cell_mut(row_idx, col_idx) {
+                    cell.text.clear();
+                    cell.covered = true;
+                    cell.covered_by_row = Some(start_row);
+                    cell.covered_by_col = Some(start_col);
+                    cell.row_span = 1;
+                    cell.col_span = 1;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Split a merged cell back into individual cells
+    /// Returns true if split was successful
+    pub fn split_cell(&mut self, row: usize, col: usize) -> bool {
+        // Get the origin cell
+        let (row_span, col_span, background) = {
+            if let Some(cell) = self.get_cell(row, col) {
+                if !cell.is_merge_origin() {
+                    return false; // Not a merged cell
+                }
+                (cell.row_span, cell.col_span, cell.background.clone())
+            } else {
+                return false;
+            }
+        };
+
+        // Reset the origin cell
+        if let Some(origin) = self.get_cell_mut(row, col) {
+            origin.row_span = 1;
+            origin.col_span = 1;
+        }
+
+        // Uncover all cells in the region
+        for row_idx in row..(row + row_span) {
+            for col_idx in col..(col + col_span) {
+                if row_idx == row && col_idx == col {
+                    continue; // Skip origin
+                }
+                if let Some(cell) = self.get_cell_mut(row_idx, col_idx) {
+                    cell.covered = false;
+                    cell.covered_by_row = None;
+                    cell.covered_by_col = None;
+                    // Optionally preserve background from the merged cell
+                    cell.background = background.clone();
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Get the actual cell that should be rendered at a position
+    /// (follows covered_by references to find the origin cell)
+    pub fn get_visible_cell(&self, row: usize, col: usize) -> Option<(usize, usize, &TableCell)> {
+        if let Some(cell) = self.get_cell(row, col) {
+            if cell.covered {
+                if let (Some(origin_row), Some(origin_col)) = (cell.covered_by_row, cell.covered_by_col) {
+                    if let Some(origin) = self.get_cell(origin_row, origin_col) {
+                        return Some((origin_row, origin_col, origin));
+                    }
+                }
+                None
+            } else {
+                Some((row, col, cell))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Check if a cell position should render content (is origin or not covered)
+    pub fn should_render_cell(&self, row: usize, col: usize) -> bool {
+        if let Some(cell) = self.get_cell(row, col) {
+            !cell.covered
         } else {
             false
         }

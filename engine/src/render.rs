@@ -701,77 +701,229 @@ fn render_table(
     let font_size = config.font_size;
     let cell_padding = 4.0;
 
-    // 1. Draw cell backgrounds
-    let mut current_y = y + border;
+    // Pre-calculate row Y positions
+    let mut row_y_positions: Vec<f64> = Vec::new();
+    let mut current_row_y = y;
+    for row_height in &layout.row_heights {
+        row_y_positions.push(current_row_y);
+        current_row_y += row_height + border;
+    }
+
+    // Pre-calculate column X positions
+    let mut col_x_positions: Vec<f64> = Vec::new();
+    let mut current_col_x = x;
+    for col_width in &layout.column_widths {
+        col_x_positions.push(current_col_x);
+        current_col_x += col_width + border;
+    }
+
+    // 1. Draw cell backgrounds (only for non-covered cells, accounting for spans)
     for (row_idx, row) in table.rows.iter().enumerate() {
-        let row_height = layout.row_heights.get(row_idx).copied().unwrap_or(line_height);
-        let mut current_x = x + border;
-
         for (col_idx, cell) in row.cells.iter().enumerate() {
-            let col_width = layout.column_widths.get(col_idx).copied().unwrap_or(100.0);
+            // Skip covered cells - the origin cell handles the entire merged area
+            if cell.covered {
+                continue;
+            }
 
-            // Draw cell background if set
             if let Some(ref bg) = cell.background {
+                // Calculate merged cell dimensions
+                let cell_x = col_x_positions.get(col_idx).copied().unwrap_or(x) + border;
+                let cell_y = row_y_positions.get(row_idx).copied().unwrap_or(y) + border;
+
+                // Calculate total width spanning multiple columns
+                let mut cell_width = 0.0;
+                for span_col in col_idx..(col_idx + cell.col_span).min(layout.column_widths.len()) {
+                    cell_width += layout.column_widths.get(span_col).copied().unwrap_or(0.0);
+                }
+                if cell.col_span > 1 {
+                    cell_width += (cell.col_span - 1) as f64 * border;
+                }
+
+                // Calculate total height spanning multiple rows
+                let mut cell_height = 0.0;
+                for span_row in row_idx..(row_idx + cell.row_span).min(layout.row_heights.len()) {
+                    cell_height += layout.row_heights.get(span_row).copied().unwrap_or(0.0);
+                }
+                if cell.row_span > 1 {
+                    cell_height += (cell.row_span - 1) as f64 * border;
+                }
+
                 commands.push(RenderCommand::FillCellBackground {
-                    x: current_x,
-                    y: current_y,
-                    width: col_width,
-                    height: row_height,
+                    x: cell_x,
+                    y: cell_y,
+                    width: cell_width,
+                    height: cell_height,
                     color: bg.clone(),
                 });
             }
-            current_x += col_width + border;
         }
-        current_y += row_height + border;
     }
 
-    // 2. Draw horizontal border lines
-    let mut line_y = y;
-    for row_height in &layout.row_heights {
-        commands.push(RenderCommand::DrawTableBorder {
-            x1: x,
-            y1: line_y,
-            x2: x + layout.total_width,
-            y2: line_y,
-            width: border,
-            color: border_color.clone(),
-        });
-        line_y += row_height + border;
-    }
-    // Bottom border
+    // 2. Draw table outer border (always draw all 4 sides)
+    // Top border
     commands.push(RenderCommand::DrawTableBorder {
         x1: x,
-        y1: line_y,
+        y1: y,
         x2: x + layout.total_width,
-        y2: line_y,
+        y2: y,
         width: border,
         color: border_color.clone(),
     });
-
-    // 3. Draw vertical border lines
-    let mut col_x = x;
-    for col_width in &layout.column_widths {
-        commands.push(RenderCommand::DrawTableBorder {
-            x1: col_x,
-            y1: y,
-            x2: col_x,
-            y2: y + layout.total_height,
-            width: border,
-            color: border_color.clone(),
-        });
-        col_x += col_width + border;
-    }
+    // Bottom border
+    commands.push(RenderCommand::DrawTableBorder {
+        x1: x,
+        y1: y + layout.total_height,
+        x2: x + layout.total_width,
+        y2: y + layout.total_height,
+        width: border,
+        color: border_color.clone(),
+    });
+    // Left border
+    commands.push(RenderCommand::DrawTableBorder {
+        x1: x,
+        y1: y,
+        x2: x,
+        y2: y + layout.total_height,
+        width: border,
+        color: border_color.clone(),
+    });
     // Right border
     commands.push(RenderCommand::DrawTableBorder {
-        x1: col_x,
+        x1: x + layout.total_width,
         y1: y,
-        x2: col_x,
+        x2: x + layout.total_width,
         y2: y + layout.total_height,
         width: border,
         color: border_color.clone(),
     });
 
-    // 4. Draw cell text
+    // 3. Draw internal horizontal lines (skip lines inside merged cells)
+    for row_idx in 1..layout.row_heights.len() {
+        let line_y = row_y_positions.get(row_idx).copied().unwrap_or(y);
+
+        // For each column, check if this horizontal line should be drawn
+        let mut segment_start_x = x;
+        let mut col_idx = 0;
+
+        while col_idx < layout.column_widths.len() {
+            // Check if there's a cell that spans across this line
+            let mut skip_segment = false;
+            let mut skip_cols = 1;
+
+            // Look for cells in rows above that might span down past this line
+            for check_row in 0..row_idx {
+                if let Some(cell) = table.get_cell(check_row, col_idx) {
+                    if !cell.covered && cell.row_span > 1 {
+                        let span_end_row = check_row + cell.row_span;
+                        if span_end_row > row_idx {
+                            // This cell spans past our line
+                            skip_segment = true;
+                            skip_cols = cell.col_span;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if skip_segment {
+                // Draw segment before the merged cell
+                if segment_start_x < col_x_positions.get(col_idx).copied().unwrap_or(x) + border {
+                    commands.push(RenderCommand::DrawTableBorder {
+                        x1: segment_start_x,
+                        y1: line_y,
+                        x2: col_x_positions.get(col_idx).copied().unwrap_or(x) + border,
+                        y2: line_y,
+                        width: border,
+                        color: border_color.clone(),
+                    });
+                }
+                // Skip columns covered by the merge
+                col_idx += skip_cols;
+                if col_idx < col_x_positions.len() {
+                    segment_start_x = col_x_positions.get(col_idx).copied().unwrap_or(x);
+                }
+            } else {
+                col_idx += 1;
+            }
+        }
+
+        // Draw remaining segment
+        if segment_start_x < x + layout.total_width {
+            commands.push(RenderCommand::DrawTableBorder {
+                x1: segment_start_x,
+                y1: line_y,
+                x2: x + layout.total_width,
+                y2: line_y,
+                width: border,
+                color: border_color.clone(),
+            });
+        }
+    }
+
+    // 4. Draw internal vertical lines (skip lines inside merged cells)
+    for col_idx in 1..layout.column_widths.len() {
+        let line_x = col_x_positions.get(col_idx).copied().unwrap_or(x);
+
+        // For each row, check if this vertical line should be drawn
+        let mut segment_start_y = y;
+        let mut row_idx = 0;
+
+        while row_idx < layout.row_heights.len() {
+            // Check if there's a cell that spans across this line
+            let mut skip_segment = false;
+            let mut skip_rows = 1;
+
+            // Look for cells in columns to the left that might span right past this line
+            for check_col in 0..col_idx {
+                if let Some(cell) = table.get_cell(row_idx, check_col) {
+                    if !cell.covered && cell.col_span > 1 {
+                        let span_end_col = check_col + cell.col_span;
+                        if span_end_col > col_idx {
+                            // This cell spans past our line
+                            skip_segment = true;
+                            skip_rows = cell.row_span;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if skip_segment {
+                // Draw segment before the merged cell
+                if segment_start_y < row_y_positions.get(row_idx).copied().unwrap_or(y) + border {
+                    commands.push(RenderCommand::DrawTableBorder {
+                        x1: line_x,
+                        y1: segment_start_y,
+                        x2: line_x,
+                        y2: row_y_positions.get(row_idx).copied().unwrap_or(y) + border,
+                        width: border,
+                        color: border_color.clone(),
+                    });
+                }
+                // Skip rows covered by the merge
+                row_idx += skip_rows;
+                if row_idx < row_y_positions.len() {
+                    segment_start_y = row_y_positions.get(row_idx).copied().unwrap_or(y);
+                }
+            } else {
+                row_idx += 1;
+            }
+        }
+
+        // Draw remaining segment
+        if segment_start_y < y + layout.total_height {
+            commands.push(RenderCommand::DrawTableBorder {
+                x1: line_x,
+                y1: segment_start_y,
+                x2: line_x,
+                y2: y + layout.total_height,
+                width: border,
+                color: border_color.clone(),
+            });
+        }
+    }
+
+    // 5. Draw cell text (only for non-covered cells)
     commands.push(RenderCommand::SetFont {
         font: "Arial".to_string(),
         size: font_size,
@@ -782,43 +934,48 @@ fn render_table(
         color: "#202124".to_string(),
     });
 
-    current_y = y + border + cell_padding;
-    for (row_idx, row_cell_lines) in layout.cell_lines.iter().enumerate() {
-        let row_height = layout.row_heights.get(row_idx).copied().unwrap_or(line_height);
-        let mut current_x = x + border + cell_padding;
-
-        for (col_idx, cell_lines) in row_cell_lines.iter().enumerate() {
-            let col_width = layout.column_widths.get(col_idx).copied().unwrap_or(100.0);
-
-            // Get cell alignment
-            let cell_align = table.rows.get(row_idx)
-                .and_then(|r| r.cells.get(col_idx))
-                .map(|c| c.align)
-                .unwrap_or(TextAlign::Left);
-
-            // Render each line of cell text
-            let mut text_y = current_y;
-            for line in cell_lines {
-                if !line.is_empty() {
-                    // Calculate x position based on alignment
-                    let text_x = match cell_align {
-                        TextAlign::Left => current_x,
-                        TextAlign::Center => current_x + (col_width - 2.0 * cell_padding) / 2.0,
-                        TextAlign::Right => current_x + col_width - 2.0 * cell_padding,
-                        TextAlign::Justify => current_x,
-                    };
-
-                    commands.push(RenderCommand::DrawText {
-                        text: line.clone(),
-                        x: text_x,
-                        y: text_y,
-                    });
-                }
-                text_y += line_height;
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        for (col_idx, cell) in row.cells.iter().enumerate() {
+            // Skip covered cells
+            if cell.covered {
+                continue;
             }
-            current_x += col_width + border;
+
+            let cell_x = col_x_positions.get(col_idx).copied().unwrap_or(x) + border + cell_padding;
+            let cell_y = row_y_positions.get(row_idx).copied().unwrap_or(y) + border + cell_padding;
+
+            // Calculate merged cell width for alignment
+            let mut cell_width = 0.0;
+            for span_col in col_idx..(col_idx + cell.col_span).min(layout.column_widths.len()) {
+                cell_width += layout.column_widths.get(span_col).copied().unwrap_or(0.0);
+            }
+            if cell.col_span > 1 {
+                cell_width += (cell.col_span - 1) as f64 * border;
+            }
+
+            // Get cell text lines from layout
+            if let Some(cell_lines) = layout.cell_lines.get(row_idx).and_then(|r| r.get(col_idx)) {
+                let mut text_y = cell_y;
+                for line in cell_lines {
+                    if !line.is_empty() {
+                        // Calculate x position based on alignment
+                        let text_x = match cell.align {
+                            TextAlign::Left => cell_x,
+                            TextAlign::Center => cell_x + (cell_width - 2.0 * cell_padding) / 2.0,
+                            TextAlign::Right => cell_x + cell_width - 2.0 * cell_padding,
+                            TextAlign::Justify => cell_x,
+                        };
+
+                        commands.push(RenderCommand::DrawText {
+                            text: line.clone(),
+                            x: text_x,
+                            y: text_y,
+                        });
+                    }
+                    text_y += line_height;
+                }
+            }
         }
-        current_y += row_height + border;
     }
 }
 

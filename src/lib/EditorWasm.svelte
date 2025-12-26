@@ -1875,6 +1875,95 @@
   }
 
   /**
+   * Check if we have a cell selection (more than one cell selected)
+   */
+  function hasCellSelection(): boolean {
+    if (!cellSelectionStart || !cellSelectionEnd) return false;
+    return cellSelectionStart.row !== cellSelectionEnd.row ||
+           cellSelectionStart.col !== cellSelectionEnd.col;
+  }
+
+  /**
+   * Get normalized selection (start <= end)
+   */
+  function getNormalizedCellSelection() {
+    if (!cellSelectionStart || !cellSelectionEnd) return null;
+    return {
+      startRow: Math.min(cellSelectionStart.row, cellSelectionEnd.row),
+      startCol: Math.min(cellSelectionStart.col, cellSelectionEnd.col),
+      endRow: Math.max(cellSelectionStart.row, cellSelectionEnd.row),
+      endCol: Math.max(cellSelectionStart.col, cellSelectionEnd.col),
+    };
+  }
+
+  /**
+   * Check if the current cell is a merged cell (can be split)
+   */
+  function canSplitCurrentCell(): boolean {
+    if (!engine || !activeTableId || !activeCell) return false;
+    return engine.is_cell_merged(activeTableId, activeCell.row, activeCell.col);
+  }
+
+  /**
+   * Merge selected cells
+   */
+  function mergeCells() {
+    if (!engine || !activeTableId) return;
+
+    const selection = getNormalizedCellSelection();
+    if (!selection) {
+      // If no selection, try to use active cell as single cell (no merge)
+      return;
+    }
+
+    saveUndoState();
+    saveCellText();
+
+    const success = engine.merge_cells(
+      activeTableId,
+      selection.startRow,
+      selection.startCol,
+      selection.endRow,
+      selection.endCol
+    );
+
+    if (success) {
+      // Move active cell to the merge origin
+      activeCell = { row: selection.startRow, col: selection.startCol };
+      cellText = engine.get_cell_text(activeTableId, selection.startRow, selection.startCol) || '';
+      cellCursorOffset = cellText.length;
+      // Clear selection
+      cellSelectionStart = null;
+      cellSelectionEnd = null;
+    }
+
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Split current merged cell
+   */
+  function splitCurrentCell() {
+    if (!engine || !activeTableId || !activeCell) return;
+
+    if (!canSplitCurrentCell()) return;
+
+    saveUndoState();
+    saveCellText();
+
+    const success = engine.split_cell(activeTableId, activeCell.row, activeCell.col);
+
+    if (success) {
+      cellText = engine.get_cell_text(activeTableId, activeCell.row, activeCell.col) || '';
+      cellCursorOffset = cellText.length;
+    }
+
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
    * Handle format commands from the toolbar
    */
   function handleFormat(command: string, value?: string) {
@@ -3262,8 +3351,24 @@
     // Check if clicking on a table cell
     const tableClick = getTableCellAtPosition(pageIdx, x, y);
     if (tableClick) {
-      // Enter table cell editing mode
-      enterTableCell(tableClick.tableId, tableClick.tablePara, tableClick.row, tableClick.col);
+      if (event.shiftKey && activeTableId === tableClick.tableId && activeCell) {
+        // Shift-click: extend cell selection for merge
+        if (!cellSelectionStart) {
+          cellSelectionStart = { row: activeCell.row, col: activeCell.col };
+        }
+        cellSelectionEnd = { row: tableClick.row, col: tableClick.col };
+        // Update active cell to show the selection endpoint
+        activeCell = { row: tableClick.row, col: tableClick.col };
+        cellText = engine.get_cell_text(activeTableId, tableClick.row, tableClick.col) || '';
+        cellCursorOffset = cellText.length;
+        recomputeAndRender();
+      } else {
+        // Regular click: enter table cell editing mode
+        // Clear any previous cell selection
+        cellSelectionStart = { row: tableClick.row, col: tableClick.col };
+        cellSelectionEnd = { row: tableClick.row, col: tableClick.col };
+        enterTableCell(tableClick.tableId, tableClick.tablePara, tableClick.row, tableClick.col);
+      }
       hiddenTextarea?.focus();
       return;
     }
@@ -3850,6 +3955,33 @@
               <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
             </svg>
             Delete Column
+          </button>
+        </div>
+        <div class="context-menu-divider"></div>
+        <div class="context-menu-section">
+          <div class="context-menu-label">Merge / Split</div>
+          <button
+            class="context-menu-btn"
+            onclick={mergeCells}
+            disabled={!hasCellSelection()}
+            title={hasCellSelection() ? 'Merge selected cells' : 'Select multiple cells to merge (Shift+click or drag)'}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M3 3v18h18V3H3zm16 16H5V5h14v14z"/>
+              <path d="M7 7h10v10H7z"/>
+            </svg>
+            Merge Cells
+          </button>
+          <button
+            class="context-menu-btn"
+            onclick={splitCurrentCell}
+            disabled={!canSplitCurrentCell()}
+            title={canSplitCurrentCell() ? 'Split merged cell' : 'Select a merged cell to split'}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M3 3v18h18V3H3zm8 16H5V5h6v14zm8 0h-6V5h6v14z"/>
+            </svg>
+            Split Cell
           </button>
         </div>
         <div class="context-menu-divider"></div>

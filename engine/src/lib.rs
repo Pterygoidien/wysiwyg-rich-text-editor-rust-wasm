@@ -909,6 +909,84 @@ impl Engine {
         let avg_char_width = self.layout_config.font_size * 0.6;
         text.chars().count() as f64 * avg_char_width
     }
+
+    /// Merge cells in a rectangular selection
+    /// Returns true if merge was successful
+    #[wasm_bindgen]
+    pub fn merge_cells(
+        &mut self,
+        table_id: &str,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> bool {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            let result = table.merge_cells(start_row, start_col, end_row, end_col);
+            if result {
+                self.dirty = true;
+            }
+            result
+        } else {
+            false
+        }
+    }
+
+    /// Split a merged cell back into individual cells
+    /// Returns true if split was successful
+    #[wasm_bindgen]
+    pub fn split_cell(&mut self, table_id: &str, row: usize, col: usize) -> bool {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            let result = table.split_cell(row, col);
+            if result {
+                self.dirty = true;
+            }
+            result
+        } else {
+            false
+        }
+    }
+
+    /// Check if a cell is a merge origin (can be split)
+    #[wasm_bindgen]
+    pub fn is_cell_merged(&self, table_id: &str, row: usize, col: usize) -> bool {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell(row, col) {
+                return cell.is_merge_origin();
+            }
+        }
+        false
+    }
+
+    /// Check if a cell is covered by a merge
+    #[wasm_bindgen]
+    pub fn is_cell_covered(&self, table_id: &str, row: usize, col: usize) -> bool {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell(row, col) {
+                return cell.covered;
+            }
+        }
+        false
+    }
+
+    /// Get the merge info for a cell
+    /// Returns JSON { rowSpan, colSpan, covered, coveredByRow, coveredByCol } or null
+    #[wasm_bindgen]
+    pub fn get_cell_merge_info(&self, table_id: &str, row: usize, col: usize) -> JsValue {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell(row, col) {
+                let result = serde_json::json!({
+                    "rowSpan": cell.row_span,
+                    "colSpan": cell.col_span,
+                    "covered": cell.covered,
+                    "coveredByRow": cell.covered_by_row,
+                    "coveredByCol": cell.covered_by_col,
+                });
+                return JsValue::from_str(&result.to_string());
+            }
+        }
+        JsValue::NULL
+    }
 }
 
 impl Default for Engine {

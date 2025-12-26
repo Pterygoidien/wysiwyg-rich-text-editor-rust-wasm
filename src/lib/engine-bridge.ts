@@ -174,6 +174,17 @@ export interface TableCell {
   background: string | null;
   col_span: number;
   row_span: number;
+  covered: boolean;
+  covered_by_row: number | null;
+  covered_by_col: number | null;
+}
+
+export interface CellMergeInfo {
+  rowSpan: number;
+  colSpan: number;
+  covered: boolean;
+  coveredByRow: number | null;
+  coveredByCol: number | null;
 }
 
 export interface TableRow {
@@ -292,6 +303,13 @@ export interface Engine {
   set_table_border(tableId: string, width: number, color: string): void;
   get_table_dimensions(tableId: string): string | null;
   get_cell_at_position(tableId: string, relX: number, relY: number): string | null;
+
+  // Cell merge/split functions
+  merge_cells(tableId: string, startRow: number, startCol: number, endRow: number, endCol: number): boolean;
+  split_cell(tableId: string, row: number, col: number): boolean;
+  is_cell_merged(tableId: string, row: number, col: number): boolean;
+  is_cell_covered(tableId: string, row: number, col: number): boolean;
+  get_cell_merge_info(tableId: string, row: number, col: number): string | null;
 }
 
 /**
