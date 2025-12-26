@@ -114,6 +114,33 @@
     }
   }
 
+  /** Saves the document to a local JSON file */
+  function handleSave(): void {
+    const documentData = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      paragraphs,
+      paragraphMeta,
+      images: images.map(img => ({
+        ...img,
+        // Don't save base64 data URLs to keep file size manageable
+        // In production, these would be uploaded to a server
+      })),
+    };
+
+    const jsonString = JSON.stringify(documentData, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `document-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   // Text styling - using stores for font size and family
   let fontSize = $derived($fontSizeStore);
   let fontFamily = $derived($fontFamilyStore);
@@ -186,6 +213,161 @@
 
   let canvases: HTMLCanvasElement[] = [];
 
+  // Cursor style based on current operation
+  function getResizeCursor(handle: ResizeHandle): string {
+    switch (handle) {
+      case 'nw':
+      case 'se':
+        return 'nwse-resize';
+      case 'ne':
+      case 'sw':
+        return 'nesw-resize';
+      case 'n':
+      case 's':
+        return 'ns-resize';
+      case 'e':
+      case 'w':
+        return 'ew-resize';
+      default:
+        return 'default';
+    }
+  }
+
+  let canvasCursor = $derived.by(() => {
+    if (isResizing && resizeHandle) {
+      return getResizeCursor(resizeHandle);
+    }
+    if (isCropping && cropHandle) {
+      return getResizeCursor(cropHandle);
+    }
+    if (isDragging) {
+      return 'move';
+    }
+    if (selectedImageId) {
+      return 'default';
+    }
+    return 'text';
+  });
+
+  // === PERFORMANCE OPTIMIZATION: RAF Batching ===
+  let renderPending = false;
+  let renderRequestId: number | null = null;
+
+  /**
+   * Schedules a render on the next animation frame.
+   * Multiple calls within the same frame are batched into a single render.
+   */
+  function scheduleRender(): void {
+    if (renderPending) return;
+    renderPending = true;
+    renderRequestId = requestAnimationFrame(() => {
+      renderPending = false;
+      renderRequestId = null;
+      renderAllPagesInternal();
+    });
+  }
+
+  /**
+   * Forces an immediate render, bypassing RAF batching.
+   * Use sparingly - only when synchronous rendering is required.
+   */
+  function forceRender(): void {
+    if (renderRequestId !== null) {
+      cancelAnimationFrame(renderRequestId);
+      renderRequestId = null;
+      renderPending = false;
+    }
+    renderAllPagesInternal();
+  }
+
+  // === PERFORMANCE OPTIMIZATION: Text Measurement Cache ===
+  interface MeasureCacheEntry {
+    width: number;
+    lastAccess: number;
+  }
+  const measureCache = new Map<string, MeasureCacheEntry>();
+  const MEASURE_CACHE_MAX_SIZE = 2000;
+  let measureCacheAccessCounter = 0;
+
+  /**
+   * Generates a cache key for text measurement based on text and font properties.
+   */
+  function getMeasureCacheKey(text: string, meta?: ParagraphMeta): string {
+    const baseFontSize = meta?.fontSize ?? fontSize;
+    const blockType = meta?.blockType ?? 'p';
+    return `${text}|${baseFontSize}|${blockType}|${fontFamily}|${isBold}|${isItalic}|${$zoomLevel}|${letterSpacingValue}`;
+  }
+
+  /**
+   * Clears old entries from the measurement cache using LRU eviction.
+   */
+  function evictMeasureCache(): void {
+    if (measureCache.size <= MEASURE_CACHE_MAX_SIZE) return;
+
+    // Sort entries by last access time and remove oldest 25%
+    const entries = Array.from(measureCache.entries());
+    entries.sort((a, b) => a[1].lastAccess - b[1].lastAccess);
+    const toRemove = Math.floor(entries.length * 0.25);
+    for (let i = 0; i < toRemove; i++) {
+      measureCache.delete(entries[i][0]);
+    }
+  }
+
+  /**
+   * Invalidates the measurement cache when font settings change.
+   */
+  function invalidateMeasureCache(): void {
+    measureCache.clear();
+    measureCacheAccessCounter = 0;
+  }
+
+  // === PERFORMANCE OPTIMIZATION: Virtual Scrolling ===
+  let visiblePageStart = $state(0);
+  let visiblePageEnd = $state(2);
+  const PAGE_RENDER_BUFFER = 1; // Render 1 page above and below visible area
+
+  /**
+   * Updates the visible page range based on scroll position.
+   */
+  function updateVisiblePages(): void {
+    if (!canvasContainer) return;
+
+    const scrollTop = canvasContainer.scrollTop;
+    const viewportHeight = canvasContainer.clientHeight;
+    const pageHeightWithGap = scaledPageHeight + 20; // 20px gap between pages
+
+    const firstVisible = Math.floor(scrollTop / pageHeightWithGap);
+    const lastVisible = Math.ceil((scrollTop + viewportHeight) / pageHeightWithGap);
+
+    const newStart = Math.max(0, firstVisible - PAGE_RENDER_BUFFER);
+    const newEnd = Math.min(numPages, lastVisible + PAGE_RENDER_BUFFER);
+
+    if (newStart !== visiblePageStart || newEnd !== visiblePageEnd) {
+      visiblePageStart = newStart;
+      visiblePageEnd = newEnd;
+      scheduleRender();
+    }
+  }
+
+  // === PERFORMANCE OPTIMIZATION: Dirty Page Tracking ===
+  let dirtyPages = new Set<number>();
+  let fullRenderNeeded = true;
+
+  /**
+   * Marks a specific page as needing re-render.
+   */
+  function markPageDirty(pageIndex: number): void {
+    dirtyPages.add(pageIndex);
+  }
+
+  /**
+   * Marks all pages as needing re-render.
+   */
+  function markAllPagesDirty(): void {
+    fullRenderNeeded = true;
+    dirtyPages.clear();
+  }
+
   /**
    * Composes a CSS font shorthand string from current styling state.
    * Combines italic, bold, font size, and font family into a single string
@@ -201,12 +383,21 @@
    * Measures the rendered width of text using the off-screen measurement canvas.
    * Accounts for letter spacing by adding the configured spacing between characters.
    * Falls back to an estimated width if the canvas is unavailable.
+   * Uses LRU caching to avoid redundant measurements.
    *
    * @param text - The text string to measure
    * @param meta - Optional paragraph metadata for font size/style overrides
    * @returns Width in pixels
    */
   function measureTextWidth(text: string, meta?: ParagraphMeta): number {
+    // Check cache first
+    const cacheKey = getMeasureCacheKey(text, meta);
+    const cached = measureCache.get(cacheKey);
+    if (cached !== undefined) {
+      cached.lastAccess = ++measureCacheAccessCounter;
+      return cached.width;
+    }
+
     if (!measureCanvas) return text.length * scaledFontSize * 0.5;
     const ctx = measureCanvas.getContext('2d');
     if (!ctx) return text.length * scaledFontSize * 0.5;
@@ -246,7 +437,18 @@
     ctx.font = `${fontStyle}${fontWeight}${effectiveFontSize}px ${fontFamily}`;
     const baseWidth = ctx.measureText(text).width;
     const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
-    return baseWidth + (text.length > 0 ? (text.length - 1) * scaledLetterSpacing : 0);
+    const width = baseWidth + (text.length > 0 ? (text.length - 1) * scaledLetterSpacing : 0);
+
+    // Store in cache
+    measureCache.set(cacheKey, {
+      width,
+      lastAccess: ++measureCacheAccessCounter,
+    });
+
+    // Evict old entries if cache is too large
+    evictMeasureCache();
+
+    return width;
   }
 
   /**
@@ -426,12 +628,8 @@
 
       // Check if this is a page break
       if (paraText === PAGE_BREAK_MARKER) {
-        // Calculate how many lines to add to fill the current page
-        const currentLine = newDisplayLines.length;
-        const linesOnCurrentPage = currentLine % linesPerPage;
-        const linesToAdd = linesOnCurrentPage === 0 ? 0 : linesPerPage - linesOnCurrentPage;
-
-        // Add the page break marker line
+        // Add a single page break marker line
+        // The pagination phase will handle moving to the next page
         newDisplayLines.push({
           paraIndex: i,
           startOffset: 0,
@@ -440,18 +638,6 @@
           meta,
           isPageBreak: true,
         });
-
-        // Fill with empty lines to complete the page
-        for (let j = 1; j < linesToAdd; j++) {
-          newDisplayLines.push({
-            paraIndex: i,
-            startOffset: 0,
-            endOffset: 1,
-            text: '',
-            meta,
-            isPageBreak: true,
-          });
-        }
         continue;
       }
 
@@ -657,6 +843,18 @@
     for (let i = 0; i < newDisplayLines.length; i++) {
       const dl = newDisplayLines[i];
 
+      // Handle page breaks - assign to current page but force next content to new page
+      if (dl.isPageBreak) {
+        dl.pageIndex = currentPage;
+        dl.yPosition = currentY;
+        dl.columnIndex = currentColumn;
+        // Move to next page for subsequent content
+        currentPage++;
+        currentColumn = 0;
+        currentY = 0;
+        continue;
+      }
+
       // Calculate line height for this line
       let lineHeight = scaledLineHeight;
       if (dl.isImage && dl.imageHeight) {
@@ -667,7 +865,7 @@
       const spacingAfter = dl.isLastLineOfParagraph ? scaledParagraphSpacing : 0;
 
       // Check if this line would overflow the current column/page
-      if (currentY + lineHeight > maxColumnHeight && !dl.isPageBreak) {
+      if (currentY + lineHeight > maxColumnHeight) {
         // Move to next column or page
         if (columnCount > 1 && currentColumn < columnCount - 1) {
           currentColumn++;
@@ -686,13 +884,6 @@
 
       // Advance Y position
       currentY += lineHeight + spacingAfter;
-
-      // Handle page breaks - move to next page
-      if (dl.isPageBreak) {
-        currentPage++;
-        currentColumn = 0;
-        currentY = 0;
-      }
     }
 
     activeFloats = newActiveFloats;
@@ -840,15 +1031,37 @@
     document.addEventListener('mousemove', handleGlobalMouseMove);
     document.addEventListener('mouseup', handleGlobalMouseUp);
 
+    // Scroll handler for virtual scrolling optimization
+    const handleScroll = () => {
+      updateVisiblePages();
+    };
+
+    // Add scroll listener to canvas container
+    if (canvasContainer) {
+      canvasContainer.addEventListener('scroll', handleScroll, { passive: true });
+    }
+
+    // Initialize visible pages
+    updateVisiblePages();
+
     return () => {
       document.removeEventListener('paste', handleGlobalPaste);
       document.removeEventListener('mousemove', handleGlobalMouseMove);
       document.removeEventListener('mouseup', handleGlobalMouseUp);
+      if (canvasContainer) {
+        canvasContainer.removeEventListener('scroll', handleScroll);
+      }
+      // Cancel any pending render on unmount
+      if (renderRequestId !== null) {
+        cancelAnimationFrame(renderRequestId);
+      }
     };
   });
 
   $effect(() => {
     if (paragraphs && $zoomLevel && $pageConfig && scaledContentWidth > 0) {
+      // Invalidate measurement cache when zoom or page config changes
+      invalidateMeasureCache();
       recomputeDisplayLines();
     }
   });
@@ -857,6 +1070,13 @@
     if (displayLines.length > 0 && cursorPara !== undefined) {
       renderAllPages();
     }
+  });
+
+  // Invalidate measurement cache when font settings change
+  $effect(() => {
+    // Track font-related dependencies
+    const _ = [fontFamily, fontSize, isBold, isItalic, letterSpacingValue];
+    invalidateMeasureCache();
   });
 
   /**
@@ -1098,358 +1318,380 @@
   }
 
   /**
-   * Renders all pages of the document.
-   *
-   * This is the main rendering function that draws the complete document.
-   * It processes each page in sequence, rendering in multiple passes:
-   * 1. Behind-text images (wrapStyle: 'behind')
-   * 2. Floating images with text wrapping
-   * 3. Inline and top-bottom images
-   * 4. Text content with formatting, selection, and cursor
-   * 5. In-front images (wrapStyle: 'in-front')
-   * 6. Page numbers
-   *
-   * The function handles paragraph spacing, multi-column layouts,
-   * text alignment, list markers, and block-level styling.
+   * Public render function that schedules a batched render.
+   * Use this for most render calls to benefit from RAF batching.
    */
-  function renderAllPages() {
+  function renderAllPages(): void {
+    markAllPagesDirty();
+    scheduleRender();
+  }
+
+  /**
+   * Renders a single page of the document.
+   *
+   * @param pageIndex - The page index to render
+   */
+  function renderPage(pageIndex: number): void {
+    const canvas = canvases[pageIndex];
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Set canvas size with device pixel ratio for sharp text
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = scaledPageWidth * dpr;
+    canvas.height = scaledPageHeight * dpr;
+    canvas.style.width = `${scaledPageWidth}px`;
+    canvas.style.height = `${scaledPageHeight}px`;
+    ctx.scale(dpr, dpr);
+
+    // Clear and draw page background
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, scaledPageWidth, scaledPageHeight);
+
+    // Set up text rendering
+    ctx.font = getFontStyle();
+    ctx.fillStyle = '#202124';
+    ctx.textBaseline = 'top';
+
+    // Get lines belonging to this page using pre-computed pageIndex
+    const pageLines = displayLines.filter(dl => dl.pageIndex === pageIndex);
+
+    // Get cursor display position
+    const cursorDisplay = paraToDisplayPos(cursorPara, cursorOffset);
+
+    // Normalize selection
+    let selStartDisplay: { line: number; col: number } | null = null;
+    let selEndDisplay: { line: number; col: number } | null = null;
+    if (selectionStart && selectionEnd) {
+      const s1 = paraToDisplayPos(selectionStart.para, selectionStart.offset);
+      const s2 = paraToDisplayPos(selectionEnd.para, selectionEnd.offset);
+      if (s1.line < s2.line || (s1.line === s2.line && s1.col <= s2.col)) {
+        selStartDisplay = s1;
+        selEndDisplay = s2;
+      } else {
+        selStartDisplay = s2;
+        selEndDisplay = s1;
+      }
+    }
+
+    // === PASS 1: Render "behind" images first (before text) ===
+    for (const dl of pageLines) {
+      if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
+
+      const docImage = images.find(img => img.id === dl.imageId);
+      if (!docImage || docImage.wrapStyle !== 'behind') continue;
+
+      const img = loadedImages.get(docImage.id);
+      if (!img) continue;
+
+      const pos = getImagePositionFromLine(docImage, dl, pageIndex);
+      if (pos.visible) {
+        renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
+      }
+    }
+
+    // === PASS 2: Render float images (square, tight, through) ===
+    for (const float of activeFloats) {
+      const docImage = images.find(img => img.id === float.id);
+      if (!docImage) continue;
+
+      const img = loadedImages.get(docImage.id);
+      if (!img) continue;
+
+      const scaledWidth = (docImage.width * $zoomLevel) / 100;
+
+      let floatX: number;
+      let floatY: number;
+      let isVisibleOnPage = false;
+
+      // Check if image has absolute position
+      if (docImage.x !== undefined && docImage.y !== undefined) {
+        const pageHeight = contentDims.height;
+        const imagePageIndex = Math.floor(docImage.y / pageHeight);
+
+        if (imagePageIndex === pageIndex) {
+          const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+          floatX = marginLeft + (docImage.x * $zoomLevel) / 100;
+          floatY = marginTop + (yOnPage * $zoomLevel) / 100;
+          isVisibleOnPage = true;
+        }
+      } else {
+        // Find the display line for this float and use pre-computed page assignment
+        const floatLine = displayLines[float.startLine];
+        if (floatLine && floatLine.pageIndex === pageIndex) {
+          // Use pre-computed Y position and column
+          floatY = marginTop + (floatLine.yPosition ?? 0);
+          const floatColIndex = floatLine.columnIndex ?? 0;
+          const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
+          floatX = float.side === 'left'
+            ? marginLeft + floatColumnOffsetX
+            : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
+          isVisibleOnPage = true;
+        }
+      }
+
+      if (isVisibleOnPage) {
+        renderImage(ctx, docImage, img, floatX!, floatY!, pageIndex);
+      }
+    }
+
+    // === PASS 3: Render inline and top-bottom images ===
+    for (const dl of pageLines) {
+      if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
+
+      const docImage = images.find(img => img.id === dl.imageId);
+      if (!docImage) continue;
+
+      // Only render inline and top-bottom here
+      if (docImage.wrapStyle !== 'inline' && docImage.wrapStyle !== 'top-bottom') continue;
+
+      const img = loadedImages.get(docImage.id);
+      if (!img) continue;
+
+      const pos = getImagePositionFromLine(docImage, dl, pageIndex);
+      if (pos.visible) {
+        renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
+      }
+    }
+
+    // === PASS 4: Render text ===
+    for (const dl of pageLines) {
+      if (dl.isImage || dl.isPageBreak) continue;
+
+      // Use pre-computed Y position
+      const y = marginTop + (dl.yPosition ?? 0);
+
+      // Calculate column offset for multi-column layout
+      const colIndex = dl.columnIndex ?? 0;
+      const columnOffsetX = colIndex * (columnWidth + columnGap);
+
+      const text = dl.text;
+      const meta = dl.meta;
+      const lineIndex = displayLines.indexOf(dl);
+
+      // Calculate list indent and float offset
+      const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
+      const floatOffset = dl.floatReduction && dl.floatReduction.side === 'left' ? dl.floatReduction.width + 10 : 0;
+      const textStartX = marginLeft + columnOffsetX + listIndent + floatOffset;
+
+      // Get font style based on block type
+      // Use paragraph-specific font size if set, otherwise use global
+      const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
+      let blockFontSize = baseFontSize;
+      let blockFontWeight = isBold ? 'bold ' : '';
+      let blockFontStyle = isItalic ? 'italic ' : '';
+
+      switch (meta.blockType) {
+        case 'h1':
+          blockFontSize = baseFontSize * 2;
+          blockFontWeight = 'bold ';
+          break;
+        case 'h2':
+          blockFontSize = baseFontSize * 1.5;
+          blockFontWeight = 'bold ';
+          break;
+        case 'h3':
+          blockFontSize = baseFontSize * 1.17;
+          blockFontWeight = 'bold ';
+          break;
+        case 'h4':
+          blockFontWeight = 'bold ';
+          break;
+        case 'blockquote':
+          blockFontStyle = 'italic ';
+          break;
+      }
+
+      const lineFont = `${blockFontStyle}${blockFontWeight}${blockFontSize}px ${fontFamily}`;
+      ctx.font = lineFont;
+
+      const textWidth = ctx.measureText(text).width;
+      const floatWidthReduction = dl.floatReduction ? dl.floatReduction.width + 10 : 0;
+      const availableWidth = columnWidth - listIndent - floatWidthReduction;
+
+      let x = textStartX;
+      let wordSpacing = 0;
+      const words = text.split(' ');
+      const isLastLineOfPara = dl.endOffset >= paragraphs[dl.paraIndex].length;
+
+      switch (meta.align) {
+        case 'center':
+          x = textStartX + (availableWidth - textWidth) / 2;
+          break;
+        case 'right':
+          x = textStartX + availableWidth - textWidth;
+          break;
+        case 'justify':
+          if (!isLastLineOfPara && words.length > 1 && text.trim().length > 0) {
+            const extraSpace = availableWidth - textWidth;
+            wordSpacing = extraSpace / (words.length - 1);
+          }
+          break;
+      }
+
+      // Draw selection highlight
+      if (selStartDisplay && selEndDisplay) {
+        if (lineIndex >= selStartDisplay.line && lineIndex <= selEndDisplay.line) {
+          ctx.fillStyle = '#b4d7ff';
+          const startCol = lineIndex === selStartDisplay.line ? selStartDisplay.col : 0;
+          const endCol = lineIndex === selEndDisplay.line ? selEndDisplay.col : text.length;
+          const selStartX = x + ctx.measureText(text.substring(0, startCol)).width;
+          const selWidth = ctx.measureText(text.substring(startCol, endCol)).width || 5;
+          ctx.fillRect(selStartX, y, selWidth, scaledLineHeight);
+        }
+      }
+
+      // Draw list marker
+      if (dl.startOffset === 0 && meta.listType !== 'none') {
+        ctx.fillStyle = '#202124';
+        if (meta.listType === 'bullet') {
+          const bulletX = marginLeft + columnOffsetX + scaledFontSize * 0.5;
+          const bulletY = y + scaledLineHeight / 2;
+          ctx.beginPath();
+          ctx.arc(bulletX, bulletY, scaledFontSize * 0.15, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (meta.listType === 'numbered' && dl.listNumber) {
+          ctx.font = `${scaledFontSize}px ${fontFamily}`;
+          ctx.textAlign = 'right';
+          ctx.fillText(`${dl.listNumber}.`, marginLeft + columnOffsetX + scaledFontSize * 1.2, y + (scaledLineHeight - scaledFontSize) / 2);
+          ctx.textAlign = 'left';
+          ctx.font = lineFont;
+        }
+      }
+
+      // Draw blockquote indicator
+      if (meta.blockType === 'blockquote' && dl.startOffset === 0) {
+        ctx.fillStyle = '#ccc';
+        ctx.fillRect(marginLeft + columnOffsetX, y, 3, scaledLineHeight);
+      }
+
+      // Draw text
+      ctx.fillStyle = meta.textColor || '#202124';
+      ctx.font = lineFont;
+      const textY = y + (scaledLineHeight - blockFontSize) / 2;
+      const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
+
+      // Function to draw text with letter spacing
+      const drawTextWithSpacing = (str: string, startX: number) => {
+        if (scaledLetterSpacing === 0) {
+          ctx.fillText(str, startX, textY);
+          return ctx.measureText(str).width;
+        } else {
+          let charX = startX;
+          for (let c = 0; c < str.length; c++) {
+            ctx.fillText(str[c], charX, textY);
+            charX += ctx.measureText(str[c]).width + scaledLetterSpacing;
+          }
+          return charX - startX - scaledLetterSpacing; // subtract last spacing
+        }
+      };
+
+      if (wordSpacing > 0 && meta.align === 'justify') {
+        let wordX = x;
+        for (let w = 0; w < words.length; w++) {
+          drawTextWithSpacing(words[w], wordX);
+          wordX += ctx.measureText(words[w]).width + (words[w].length * scaledLetterSpacing);
+          if (w < words.length - 1) {
+            wordX += ctx.measureText(' ').width + wordSpacing;
+          }
+        }
+      } else {
+        drawTextWithSpacing(text, x);
+      }
+
+      const renderedWidth = wordSpacing > 0 ? availableWidth : textWidth;
+
+      // Draw underline
+      if (isUnderline && text.length > 0) {
+        const underlineY = y + scaledLineHeight - 4;
+        ctx.strokeStyle = '#202124';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, underlineY);
+        ctx.lineTo(x + renderedWidth, underlineY);
+        ctx.stroke();
+      }
+
+      // Draw strikethrough
+      if (isStrikethrough && text.length > 0) {
+        const strikeY = y + scaledLineHeight / 2;
+        ctx.strokeStyle = '#202124';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, strikeY);
+        ctx.lineTo(x + renderedWidth, strikeY);
+        ctx.stroke();
+      }
+
+      // Draw cursor
+      if (lineIndex === cursorDisplay.line && !selectionStart) {
+        let cursorX = x;
+        if (wordSpacing > 0 && meta.align === 'justify') {
+          const textBeforeCursor = text.substring(0, cursorDisplay.col);
+          const wordsBeforeCursor = textBeforeCursor.split(' ');
+          const spacesBeforeCursor = wordsBeforeCursor.length - 1;
+          cursorX = x + ctx.measureText(textBeforeCursor).width + (spacesBeforeCursor * wordSpacing);
+        } else {
+          cursorX = x + ctx.measureText(text.substring(0, cursorDisplay.col)).width;
+        }
+        ctx.fillStyle = '#000';
+        ctx.fillRect(cursorX, y + 2, 2, scaledLineHeight - 4);
+      }
+    }
+
+    // === PASS 5: Render "in-front" images last (after text) ===
+    for (const dl of pageLines) {
+      if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
+
+      const docImage = images.find(img => img.id === dl.imageId);
+      if (!docImage || docImage.wrapStyle !== 'in-front') continue;
+
+      const img = loadedImages.get(docImage.id);
+      if (!img) continue;
+
+      const pos = getImagePositionFromLine(docImage, dl, pageIndex);
+      if (pos.visible) {
+        renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
+      }
+    }
+
+    // Draw page number
+    ctx.fillStyle = '#999';
+    ctx.font = `10px ${fontFamily}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`${pageIndex + 1}`, scaledPageWidth / 2, scaledPageHeight - 20);
+    ctx.textAlign = 'left';
+  }
+
+  /**
+   * Internal rendering function that implements virtual scrolling and dirty page tracking.
+   * Only renders pages that are visible and marked as dirty.
+   */
+  function renderAllPagesInternal(): void {
     const pageCount = numPages;
 
     for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
-      const canvas = canvases[pageIndex];
-      if (!canvas) continue;
+      // Virtual scrolling: only render pages in visible range
+      const isInVisibleRange = pageIndex >= visiblePageStart && pageIndex < visiblePageEnd;
 
-      const ctx = canvas.getContext('2d');
-      if (!ctx) continue;
-
-      // Set canvas size with device pixel ratio for sharp text
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = scaledPageWidth * dpr;
-      canvas.height = scaledPageHeight * dpr;
-      canvas.style.width = `${scaledPageWidth}px`;
-      canvas.style.height = `${scaledPageHeight}px`;
-      ctx.scale(dpr, dpr);
-
-      // Clear and draw page background
-      ctx.fillStyle = 'white';
-      ctx.fillRect(0, 0, scaledPageWidth, scaledPageHeight);
-
-      // Set up text rendering
-      ctx.font = getFontStyle();
-      ctx.fillStyle = '#202124';
-      ctx.textBaseline = 'top';
-
-      // Get lines belonging to this page using pre-computed pageIndex
-      const pageLines = displayLines.filter(dl => dl.pageIndex === pageIndex);
-
-      // Get cursor display position
-      const cursorDisplay = paraToDisplayPos(cursorPara, cursorOffset);
-
-      // Normalize selection
-      let selStartDisplay: { line: number; col: number } | null = null;
-      let selEndDisplay: { line: number; col: number } | null = null;
-      if (selectionStart && selectionEnd) {
-        const s1 = paraToDisplayPos(selectionStart.para, selectionStart.offset);
-        const s2 = paraToDisplayPos(selectionEnd.para, selectionEnd.offset);
-        if (s1.line < s2.line || (s1.line === s2.line && s1.col <= s2.col)) {
-          selStartDisplay = s1;
-          selEndDisplay = s2;
-        } else {
-          selStartDisplay = s2;
-          selEndDisplay = s1;
-        }
+      // Skip if page is not visible and not dirty
+      if (!isInVisibleRange && !fullRenderNeeded && !dirtyPages.has(pageIndex)) {
+        continue;
       }
 
-      // === PASS 1: Render "behind" images first (before text) ===
-      for (const dl of pageLines) {
-        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
-
-        const docImage = images.find(img => img.id === dl.imageId);
-        if (!docImage || docImage.wrapStyle !== 'behind') continue;
-
-        const img = loadedImages.get(docImage.id);
-        if (!img) continue;
-
-        const displayLineIdx = displayLines.indexOf(dl);
-        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
-        if (pos.visible) {
-          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
-        }
+      // Skip if page is visible but not dirty (unless full render needed)
+      if (!fullRenderNeeded && !dirtyPages.has(pageIndex)) {
+        continue;
       }
 
-      // === PASS 2: Render float images (square, tight, through) ===
-      for (const float of activeFloats) {
-        const docImage = images.find(img => img.id === float.id);
-        if (!docImage) continue;
-
-        const img = loadedImages.get(docImage.id);
-        if (!img) continue;
-
-        const scaledWidth = (docImage.width * $zoomLevel) / 100;
-
-        let floatX: number;
-        let floatY: number;
-        let isVisibleOnPage = false;
-
-        // Check if image has absolute position
-        if (docImage.x !== undefined && docImage.y !== undefined) {
-          const pageHeight = contentDims.height;
-          const imagePageIndex = Math.floor(docImage.y / pageHeight);
-
-          if (imagePageIndex === pageIndex) {
-            const yOnPage = docImage.y - (imagePageIndex * pageHeight);
-            floatX = marginLeft + (docImage.x * $zoomLevel) / 100;
-            floatY = marginTop + (yOnPage * $zoomLevel) / 100;
-            isVisibleOnPage = true;
-          }
-        } else {
-          // Find the display line for this float and use pre-computed page assignment
-          const floatLine = displayLines[float.startLine];
-          if (floatLine && floatLine.pageIndex === pageIndex) {
-            // Use pre-computed Y position and column
-            floatY = marginTop + (floatLine.yPosition ?? 0);
-            const floatColIndex = floatLine.columnIndex ?? 0;
-            const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
-            floatX = float.side === 'left'
-              ? marginLeft + floatColumnOffsetX
-              : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
-            isVisibleOnPage = true;
-          }
-        }
-
-        if (isVisibleOnPage) {
-          renderImage(ctx, docImage, img, floatX!, floatY!, pageIndex);
-        }
-      }
-
-      // === PASS 3: Render inline and top-bottom images ===
-      for (const dl of pageLines) {
-        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
-
-        const docImage = images.find(img => img.id === dl.imageId);
-        if (!docImage) continue;
-
-        // Only render inline and top-bottom here
-        if (docImage.wrapStyle !== 'inline' && docImage.wrapStyle !== 'top-bottom') continue;
-
-        const img = loadedImages.get(docImage.id);
-        if (!img) continue;
-
-        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
-        if (pos.visible) {
-          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
-        }
-      }
-
-      // === PASS 4: Render text ===
-      for (const dl of pageLines) {
-        if (dl.isImage || dl.isPageBreak) continue;
-
-        // Use pre-computed Y position
-        const y = marginTop + (dl.yPosition ?? 0);
-
-        // Calculate column offset for multi-column layout
-        const colIndex = dl.columnIndex ?? 0;
-        const columnOffsetX = colIndex * (columnWidth + columnGap);
-
-        const text = dl.text;
-        const meta = dl.meta;
-        const lineIndex = displayLines.indexOf(dl);
-
-        // Calculate list indent and float offset
-        const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
-        const floatOffset = dl.floatReduction && dl.floatReduction.side === 'left' ? dl.floatReduction.width + 10 : 0;
-        const textStartX = marginLeft + columnOffsetX + listIndent + floatOffset;
-
-        // Get font style based on block type
-        // Use paragraph-specific font size if set, otherwise use global
-        const baseFontSize = meta.fontSize ? (meta.fontSize * $zoomLevel) / 100 : scaledFontSize;
-        let blockFontSize = baseFontSize;
-        let blockFontWeight = isBold ? 'bold ' : '';
-        let blockFontStyle = isItalic ? 'italic ' : '';
-
-        switch (meta.blockType) {
-          case 'h1':
-            blockFontSize = baseFontSize * 2;
-            blockFontWeight = 'bold ';
-            break;
-          case 'h2':
-            blockFontSize = baseFontSize * 1.5;
-            blockFontWeight = 'bold ';
-            break;
-          case 'h3':
-            blockFontSize = baseFontSize * 1.17;
-            blockFontWeight = 'bold ';
-            break;
-          case 'h4':
-            blockFontWeight = 'bold ';
-            break;
-          case 'blockquote':
-            blockFontStyle = 'italic ';
-            break;
-        }
-
-        const lineFont = `${blockFontStyle}${blockFontWeight}${blockFontSize}px ${fontFamily}`;
-        ctx.font = lineFont;
-
-        const textWidth = ctx.measureText(text).width;
-        const floatWidthReduction = dl.floatReduction ? dl.floatReduction.width + 10 : 0;
-        const availableWidth = columnWidth - listIndent - floatWidthReduction;
-
-        let x = textStartX;
-        let wordSpacing = 0;
-        const words = text.split(' ');
-        const isLastLineOfPara = dl.endOffset >= paragraphs[dl.paraIndex].length;
-
-        switch (meta.align) {
-          case 'center':
-            x = textStartX + (availableWidth - textWidth) / 2;
-            break;
-          case 'right':
-            x = textStartX + availableWidth - textWidth;
-            break;
-          case 'justify':
-            if (!isLastLineOfPara && words.length > 1 && text.trim().length > 0) {
-              const extraSpace = availableWidth - textWidth;
-              wordSpacing = extraSpace / (words.length - 1);
-            }
-            break;
-        }
-
-        // Draw selection highlight
-        if (selStartDisplay && selEndDisplay) {
-          if (lineIndex >= selStartDisplay.line && lineIndex <= selEndDisplay.line) {
-            ctx.fillStyle = '#b4d7ff';
-            const startCol = lineIndex === selStartDisplay.line ? selStartDisplay.col : 0;
-            const endCol = lineIndex === selEndDisplay.line ? selEndDisplay.col : text.length;
-            const selStartX = x + ctx.measureText(text.substring(0, startCol)).width;
-            const selWidth = ctx.measureText(text.substring(startCol, endCol)).width || 5;
-            ctx.fillRect(selStartX, y, selWidth, scaledLineHeight);
-          }
-        }
-
-        // Draw list marker
-        if (dl.startOffset === 0 && meta.listType !== 'none') {
-          ctx.fillStyle = '#202124';
-          if (meta.listType === 'bullet') {
-            const bulletX = marginLeft + columnOffsetX + scaledFontSize * 0.5;
-            const bulletY = y + scaledLineHeight / 2;
-            ctx.beginPath();
-            ctx.arc(bulletX, bulletY, scaledFontSize * 0.15, 0, Math.PI * 2);
-            ctx.fill();
-          } else if (meta.listType === 'numbered' && dl.listNumber) {
-            ctx.font = `${scaledFontSize}px ${fontFamily}`;
-            ctx.textAlign = 'right';
-            ctx.fillText(`${dl.listNumber}.`, marginLeft + columnOffsetX + scaledFontSize * 1.2, y + (scaledLineHeight - scaledFontSize) / 2);
-            ctx.textAlign = 'left';
-            ctx.font = lineFont;
-          }
-        }
-
-        // Draw blockquote indicator
-        if (meta.blockType === 'blockquote' && dl.startOffset === 0) {
-          ctx.fillStyle = '#ccc';
-          ctx.fillRect(marginLeft + columnOffsetX, y, 3, scaledLineHeight);
-        }
-
-        // Draw text
-        ctx.fillStyle = meta.textColor || '#202124';
-        ctx.font = lineFont;
-        const textY = y + (scaledLineHeight - blockFontSize) / 2;
-        const scaledLetterSpacing = (letterSpacingValue * $zoomLevel) / 100;
-
-        // Function to draw text with letter spacing
-        const drawTextWithSpacing = (str: string, startX: number) => {
-          if (scaledLetterSpacing === 0) {
-            ctx.fillText(str, startX, textY);
-            return ctx.measureText(str).width;
-          } else {
-            let charX = startX;
-            for (let c = 0; c < str.length; c++) {
-              ctx.fillText(str[c], charX, textY);
-              charX += ctx.measureText(str[c]).width + scaledLetterSpacing;
-            }
-            return charX - startX - scaledLetterSpacing; // subtract last spacing
-          }
-        };
-
-        if (wordSpacing > 0 && meta.align === 'justify') {
-          let wordX = x;
-          for (let w = 0; w < words.length; w++) {
-            drawTextWithSpacing(words[w], wordX);
-            wordX += ctx.measureText(words[w]).width + (words[w].length * scaledLetterSpacing);
-            if (w < words.length - 1) {
-              wordX += ctx.measureText(' ').width + wordSpacing;
-            }
-          }
-        } else {
-          drawTextWithSpacing(text, x);
-        }
-
-        const renderedWidth = wordSpacing > 0 ? availableWidth : textWidth;
-
-        // Draw underline
-        if (isUnderline && text.length > 0) {
-          const underlineY = y + scaledLineHeight - 4;
-          ctx.strokeStyle = '#202124';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(x, underlineY);
-          ctx.lineTo(x + renderedWidth, underlineY);
-          ctx.stroke();
-        }
-
-        // Draw strikethrough
-        if (isStrikethrough && text.length > 0) {
-          const strikeY = y + scaledLineHeight / 2;
-          ctx.strokeStyle = '#202124';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(x, strikeY);
-          ctx.lineTo(x + renderedWidth, strikeY);
-          ctx.stroke();
-        }
-
-        // Draw cursor
-        if (lineIndex === cursorDisplay.line && !selectionStart) {
-          let cursorX = x;
-          if (wordSpacing > 0 && meta.align === 'justify') {
-            const textBeforeCursor = text.substring(0, cursorDisplay.col);
-            const wordsBeforeCursor = textBeforeCursor.split(' ');
-            const spacesBeforeCursor = wordsBeforeCursor.length - 1;
-            cursorX = x + ctx.measureText(textBeforeCursor).width + (spacesBeforeCursor * wordSpacing);
-          } else {
-            cursorX = x + ctx.measureText(text.substring(0, cursorDisplay.col)).width;
-          }
-          ctx.fillStyle = '#000';
-          ctx.fillRect(cursorX, y + 2, 2, scaledLineHeight - 4);
-        }
-
-      }
-
-      // === PASS 5: Render "in-front" images last (after text) ===
-      for (const dl of pageLines) {
-        if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
-
-        const docImage = images.find(img => img.id === dl.imageId);
-        if (!docImage || docImage.wrapStyle !== 'in-front') continue;
-
-        const img = loadedImages.get(docImage.id);
-        if (!img) continue;
-
-        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
-        if (pos.visible) {
-          renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
-        }
-      }
-
-      // Draw page number
-      ctx.fillStyle = '#999';
-      ctx.font = `10px ${fontFamily}`;
-      ctx.textAlign = 'center';
-      ctx.fillText(`${pageIndex + 1}`, scaledPageWidth / 2, scaledPageHeight - 20);
-      ctx.textAlign = 'left';
+      renderPage(pageIndex);
     }
+
+    // Clear dirty tracking after render
+    fullRenderNeeded = false;
+    dirtyPages.clear();
   }
 
   /**
@@ -1462,7 +1704,7 @@
    * - Clipboard operations (Ctrl+C/X/V)
    * - Formatting shortcuts (Ctrl+B/I/U)
    * - Special characters (Tab for indent)
-   * - Page breaks (Alt+Enter)
+   * - Page breaks (Ctrl+Enter)
    * - Image operations (Delete/Backspace when image selected)
    *
    * @param event - The keyboard event to process
@@ -1482,14 +1724,14 @@
       renderAllPages();
     }
 
-    // Alt+Enter for page break
-    if (event.altKey && key === 'Enter') {
-      event.preventDefault();
-      insertPageBreak();
-      return;
-    }
-
     if (event.ctrlKey || event.metaKey) {
+      // Ctrl+Enter for page break
+      if (key === 'Enter') {
+        event.preventDefault();
+        insertPageBreak();
+        return;
+      }
+
       switch (key.toLowerCase()) {
         case 'b':
           event.preventDefault();
@@ -1542,6 +1784,11 @@
           // Ctrl+Y = Redo
           event.preventDefault();
           performRedo();
+          return;
+        case 's':
+          // Ctrl+S = Save
+          event.preventDefault();
+          handleSave();
           return;
       }
     }
@@ -3073,7 +3320,7 @@
 </script>
 
 <div class="editor-wrapper">
-  <Toolbar onFormat={handleFormat} {canUndo} {canRedo} />
+  <Toolbar onFormat={handleFormat} {canUndo} {canRedo} onSave={handleSave} />
 
   <!-- Hidden canvas for text measurement -->
   <canvas bind:this={measureCanvas} class="measure-canvas"></canvas>
@@ -3096,6 +3343,7 @@
           bind:this={canvases[pageIndex]}
           class="page-canvas"
           class:active={$currentPage === pageIndex + 1}
+          style="cursor: {canvasCursor};"
           onmousedown={(e) => handleCanvasMouseDown(e, pageIndex)}
         ></canvas>
       {/each}
@@ -3453,7 +3701,7 @@
 
   .page-canvas {
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.24);
-    cursor: text;
+    /* cursor is set dynamically via inline style based on current operation */
   }
 
   .page-canvas.active {

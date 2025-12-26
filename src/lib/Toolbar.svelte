@@ -7,9 +7,10 @@
     onFormat: (command: string, value?: string) => void;
     canUndo?: boolean;
     canRedo?: boolean;
+    onSave?: () => void;
   }
 
-  let { onFormat, canUndo = false, canRedo = false }: Props = $props();
+  let { onFormat, canUndo = false, canRedo = false, onSave }: Props = $props();
 
   let showPageSettings = $state(false);
   let showColumnsPopup = $state(false);
@@ -135,6 +136,15 @@
     >
       <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
         <path d="M18.4 10.6C16.55 8.99 14.15 8 11.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7l-3.6 3.6z"/>
+      </svg>
+    </button>
+    <button
+      class="toolbar-btn"
+      onclick={() => onSave?.()}
+      title="Save (Ctrl+S)"
+    >
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/>
       </svg>
     </button>
   </div>
