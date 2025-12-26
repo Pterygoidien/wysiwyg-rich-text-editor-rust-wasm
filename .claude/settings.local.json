@@ -11,7 +11,15 @@
       "Bash(npm run build:*)",
       "Bash(dir /s /b \"c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\")",
       "Bash(findstr:*)",
-      "Bash(cargo install:*)"
+      "Bash(cargo install:*)",
+      "Bash(cargo test:*)",
+      "Bash(cmd /c \"cargo test 2>&1\")",
+      "Bash(cmd /c \"cd /d c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine && cargo test\")",
+      "Bash(powershell -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine''; cargo test 2>&1\")",
+      "Bash(cmd /c \"pushd c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine && cargo test 2>&1\")",
+      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine''; cargo test 2>&1 | Out-String\")",
+      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated''; npm run build:wasm 2>&1 | Out-String\")",
+      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated''; npm run build 2>&1 | Out-String\")"
     ]
   }
 }

@@ -1,0 +1,9 @@
+C:\Programmation\projects\medilearn\playgrounds\rich-text-editor-paginated\engine\target\debug\deps\wasm_bindgen_futures-f0dec6ec413de4a2.d: C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\lib.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\queue.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\task\singlethread.rs
+
+C:\Programmation\projects\medilearn\playgrounds\rich-text-editor-paginated\engine\target\debug\deps\libwasm_bindgen_futures-f0dec6ec413de4a2.rlib: C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\lib.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\queue.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\task\singlethread.rs
+
+C:\Programmation\projects\medilearn\playgrounds\rich-text-editor-paginated\engine\target\debug\deps\libwasm_bindgen_futures-f0dec6ec413de4a2.rmeta: C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\lib.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\queue.rs C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\task\singlethread.rs
+
+C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\lib.rs:
+C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\queue.rs:
+C:\Users\Bertrand\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wasm-bindgen-futures-0.4.56\src\task\singlethread.rs:

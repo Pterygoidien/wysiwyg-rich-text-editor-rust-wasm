@@ -535,6 +535,93 @@ fn measure_text(
     }
 }
 
+/// Result of mapping a paragraph position to a display position
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayPosition {
+    /// Display line index
+    pub line: usize,
+    /// Column offset within the display line
+    pub col: usize,
+}
+
+/// Result of mapping a display position to a paragraph position
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParagraphPosition {
+    /// Paragraph index
+    pub para: usize,
+    /// Character offset within the paragraph
+    pub offset: usize,
+}
+
+/// Convert a paragraph position (para index, char offset) to a display line position.
+/// Used for mapping cursor/selection positions to rendered coordinates.
+pub fn para_to_display_pos(
+    display_lines: &[DisplayLine],
+    para: usize,
+    offset: usize,
+) -> DisplayPosition {
+    for (i, dl) in display_lines.iter().enumerate() {
+        if dl.para_index == para && offset >= dl.start_offset && offset <= dl.end_offset {
+            return DisplayPosition {
+                line: i,
+                col: offset - dl.start_offset,
+            };
+        }
+    }
+
+    // Fallback to last line
+    let last_line = display_lines.len().saturating_sub(1);
+    let last_col = display_lines
+        .last()
+        .map(|dl| dl.text.len())
+        .unwrap_or(0);
+
+    DisplayPosition {
+        line: last_line,
+        col: last_col,
+    }
+}
+
+/// Convert a display line position to a paragraph position.
+/// Used for mapping click coordinates back to document positions.
+pub fn display_to_para(
+    display_lines: &[DisplayLine],
+    line: usize,
+    col: usize,
+) -> ParagraphPosition {
+    if line >= display_lines.len() {
+        // Beyond end of document
+        if let Some(last) = display_lines.last() {
+            return ParagraphPosition {
+                para: last.para_index,
+                offset: last.end_offset,
+            };
+        }
+        return ParagraphPosition { para: 0, offset: 0 };
+    }
+
+    let dl = &display_lines[line];
+    let clamped_col = col.min(dl.text.len());
+
+    ParagraphPosition {
+        para: dl.para_index,
+        offset: dl.start_offset + clamped_col,
+    }
+}
+
+/// Get the page index for a given paragraph and offset
+pub fn get_page_for_position(
+    display_lines: &[DisplayLine],
+    para: usize,
+    offset: usize,
+) -> usize {
+    let pos = para_to_display_pos(display_lines, para, offset);
+    display_lines
+        .get(pos.line)
+        .map(|dl| dl.page_index)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +651,135 @@ mod tests {
         };
         let expected = (config.content_width() - 48.0) / 2.0;
         assert!((config.column_width() - expected).abs() < 0.001);
+    }
+
+    // Helper to create test display lines
+    fn create_test_display_lines() -> Vec<DisplayLine> {
+        vec![
+            // Paragraph 0, line 0: "Hello "
+            DisplayLine {
+                para_index: 0,
+                start_offset: 0,
+                end_offset: 6,
+                text: "Hello ".to_string(),
+                page_index: 0,
+                column_index: 0,
+                x_position: 96.0,
+                y_position: 0.0,
+                is_page_break: false,
+                is_image: false,
+                image_id: None,
+                image_height: None,
+                list_number: None,
+                is_last_line: false,
+                block_type: BlockType::Paragraph,
+                list_type: ListType::None,
+                float_reduction: None,
+            },
+            // Paragraph 0, line 1: "World"
+            DisplayLine {
+                para_index: 0,
+                start_offset: 6,
+                end_offset: 11,
+                text: "World".to_string(),
+                page_index: 0,
+                column_index: 0,
+                x_position: 96.0,
+                y_position: 24.0,
+                is_page_break: false,
+                is_image: false,
+                image_id: None,
+                image_height: None,
+                list_number: None,
+                is_last_line: true,
+                block_type: BlockType::Paragraph,
+                list_type: ListType::None,
+                float_reduction: None,
+            },
+            // Paragraph 1, line 0: "Second paragraph"
+            DisplayLine {
+                para_index: 1,
+                start_offset: 0,
+                end_offset: 16,
+                text: "Second paragraph".to_string(),
+                page_index: 0,
+                column_index: 0,
+                x_position: 96.0,
+                y_position: 48.0,
+                is_page_break: false,
+                is_image: false,
+                image_id: None,
+                image_height: None,
+                list_number: None,
+                is_last_line: true,
+                block_type: BlockType::Paragraph,
+                list_type: ListType::None,
+                float_reduction: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_para_to_display_pos_first_line() {
+        let lines = create_test_display_lines();
+        let pos = para_to_display_pos(&lines, 0, 3);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.col, 3);
+    }
+
+    #[test]
+    fn test_para_to_display_pos_wrapped_line() {
+        let lines = create_test_display_lines();
+        // Offset 8 is "or" in "World" (offset 6-11 on line 1)
+        let pos = para_to_display_pos(&lines, 0, 8);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.col, 2); // 8 - 6 = 2
+    }
+
+    #[test]
+    fn test_para_to_display_pos_second_paragraph() {
+        let lines = create_test_display_lines();
+        let pos = para_to_display_pos(&lines, 1, 7);
+        assert_eq!(pos.line, 2);
+        assert_eq!(pos.col, 7);
+    }
+
+    #[test]
+    fn test_display_to_para_first_line() {
+        let lines = create_test_display_lines();
+        let pos = display_to_para(&lines, 0, 3);
+        assert_eq!(pos.para, 0);
+        assert_eq!(pos.offset, 3);
+    }
+
+    #[test]
+    fn test_display_to_para_wrapped_line() {
+        let lines = create_test_display_lines();
+        let pos = display_to_para(&lines, 1, 2);
+        assert_eq!(pos.para, 0);
+        assert_eq!(pos.offset, 8); // 6 + 2
+    }
+
+    #[test]
+    fn test_display_to_para_second_paragraph() {
+        let lines = create_test_display_lines();
+        let pos = display_to_para(&lines, 2, 7);
+        assert_eq!(pos.para, 1);
+        assert_eq!(pos.offset, 7);
+    }
+
+    #[test]
+    fn test_display_to_para_beyond_end() {
+        let lines = create_test_display_lines();
+        let pos = display_to_para(&lines, 100, 5);
+        assert_eq!(pos.para, 1);
+        assert_eq!(pos.offset, 16); // End of last paragraph
+    }
+
+    #[test]
+    fn test_get_page_for_position() {
+        let lines = create_test_display_lines();
+        let page = get_page_for_position(&lines, 0, 3);
+        assert_eq!(page, 0);
     }
 }

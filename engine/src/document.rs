@@ -54,19 +54,22 @@ impl Paragraph {
     }
 
     /// Check if this paragraph is a page break marker
+    /// Uses Unicode replacement character U+FFFD to match JavaScript implementation
     pub fn is_page_break(&self) -> bool {
-        self.text == "\x0C" // Form feed character
+        self.text == "\u{FFFD}"
     }
 
     /// Check if this paragraph is an image marker
+    /// Uses Unicode object replacement character U+FFFC to match JavaScript implementation
     pub fn is_image(&self) -> bool {
-        self.text.starts_with('\x01') // SOH character
+        self.text.starts_with('\u{FFFC}')
     }
 
     /// Get image ID if this is an image paragraph
     pub fn image_id(&self) -> Option<&str> {
         if self.is_image() {
-            Some(&self.text[1..])
+            // Skip the U+FFFC marker character (3 bytes in UTF-8)
+            Some(&self.text[3..])
         } else {
             None
         }
@@ -271,20 +274,35 @@ mod tests {
 
     #[test]
     fn test_paragraph_page_break() {
-        let para = Paragraph::new("\x0C".to_string());
+        let para = Paragraph::new("\u{FFFD}".to_string());
         assert!(para.is_page_break());
     }
 
     #[test]
+    fn test_paragraph_not_page_break() {
+        let para = Paragraph::new("regular text".to_string());
+        assert!(!para.is_page_break());
+    }
+
+    #[test]
     fn test_paragraph_image() {
-        let para = Paragraph::new("\x01image-123".to_string());
+        let para = Paragraph::new("\u{FFFC}image-123".to_string());
         assert!(para.is_image());
         assert_eq!(para.image_id(), Some("image-123"));
     }
 
     #[test]
+    fn test_paragraph_not_image() {
+        let para = Paragraph::new("regular text".to_string());
+        assert!(!para.is_image());
+        assert_eq!(para.image_id(), None);
+    }
+
+    #[test]
     fn test_block_type_multipliers() {
         assert_eq!(BlockType::Heading1.font_size_multiplier(), 2.0);
+        assert_eq!(BlockType::Heading2.font_size_multiplier(), 1.5);
+        assert_eq!(BlockType::Heading3.font_size_multiplier(), 1.17);
         assert_eq!(BlockType::Paragraph.font_size_multiplier(), 1.0);
     }
 }

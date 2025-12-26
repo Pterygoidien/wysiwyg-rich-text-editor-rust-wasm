@@ -195,25 +195,47 @@ impl Engine {
     }
 
     /// Convert paragraph position to display line position
+    /// Returns JSON: { line, col, page, x, y }
     #[wasm_bindgen]
     pub fn para_to_display_pos(&self, para_index: usize, char_offset: usize) -> JsValue {
-        for (line_idx, dl) in self.display_lines.iter().enumerate() {
-            if dl.para_index == para_index
-                && char_offset >= dl.start_offset
-                && char_offset <= dl.end_offset
-            {
-                let col = char_offset - dl.start_offset;
-                let result = serde_json::json!({
-                    "line": line_idx,
-                    "col": col,
-                    "page": dl.page_index,
-                    "x": dl.x_position,
-                    "y": dl.y_position,
-                });
-                return JsValue::from_str(&result.to_string());
-            }
+        let pos = layout::para_to_display_pos(&self.display_lines, para_index, char_offset);
+
+        if let Some(dl) = self.display_lines.get(pos.line) {
+            let result = serde_json::json!({
+                "line": pos.line,
+                "col": pos.col,
+                "page": dl.page_index,
+                "x": dl.x_position,
+                "y": dl.y_position,
+            });
+            JsValue::from_str(&result.to_string())
+        } else {
+            JsValue::NULL
         }
-        JsValue::NULL
+    }
+
+    /// Convert display line position to paragraph position
+    /// Returns JSON: { para, offset }
+    #[wasm_bindgen]
+    pub fn display_to_para(&self, line: usize, col: usize) -> JsValue {
+        let pos = layout::display_to_para(&self.display_lines, line, col);
+        let result = serde_json::json!({
+            "para": pos.para,
+            "offset": pos.offset,
+        });
+        JsValue::from_str(&result.to_string())
+    }
+
+    /// Get the page index for a given paragraph and offset
+    #[wasm_bindgen]
+    pub fn get_page_for_position(&self, para_index: usize, char_offset: usize) -> usize {
+        layout::get_page_for_position(&self.display_lines, para_index, char_offset)
+    }
+
+    /// Get total number of display lines
+    #[wasm_bindgen]
+    pub fn display_line_count(&self) -> usize {
+        self.display_lines.len()
     }
 
     /// Load document from JSON

@@ -101,6 +101,20 @@ export interface DrawLineCommand {
   width: number;
 }
 
+// Position mapping result types
+export interface DisplayPosition {
+  line: number;
+  col: number;
+  page: number;
+  x: number;
+  y: number;
+}
+
+export interface ParagraphPosition {
+  para: number;
+  offset: number;
+}
+
 // Engine type (will be filled when WASM loads)
 export interface Engine {
   new(): Engine;
@@ -129,13 +143,43 @@ export interface Engine {
   page_count(): number;
   get_render_commands(pageIndex: number): string;
   get_display_lines_json(): string;
+  display_line_count(): number;
+
+  // Position mapping functions
   para_to_display_pos(paraIndex: number, charOffset: number): string | null;
+  display_to_para(line: number, col: number): string | null;
+  get_page_for_position(paraIndex: number, charOffset: number): number;
+
+  // Document I/O
   load_document(json: string): void;
   save_document(): string;
 }
 
+/**
+ * Parse position result from engine
+ */
+export function parseDisplayPosition(json: string | null): DisplayPosition | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as DisplayPosition;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse paragraph position result from engine
+ */
+export function parseParagraphPosition(json: string | null): ParagraphPosition | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as ParagraphPosition;
+  } catch {
+    return null;
+  }
+}
+
 // WASM module state
-let wasmModule: { Engine: new() => Engine } | null = null;
 let engineInstance: Engine | null = null;
 
 /**
@@ -148,12 +192,10 @@ export async function initEngine(): Promise<Engine> {
 
   try {
     // Dynamic import of the WASM module
-    // @ts-expect-error - WASM module types
     const wasm = await import('./engine-wasm/editor_engine.js');
     await wasm.default();
 
-    wasmModule = wasm;
-    engineInstance = new wasm.Engine();
+    engineInstance = new wasm.Engine() as unknown as Engine;
 
     console.log('WASM engine initialized');
     return engineInstance;
@@ -211,7 +253,7 @@ export function executeRenderCommands(
   for (const cmd of commands) {
     switch (cmd.type) {
       case 'setFont': {
-        const c = cmd as SetFontCommand;
+        const c = cmd as unknown as SetFontCommand;
         const style = c.italic ? 'italic ' : '';
         const weight = c.bold ? 'bold ' : '';
         ctx.font = `${style}${weight}${c.size}px ${c.font || fontFamily}`;
@@ -219,25 +261,25 @@ export function executeRenderCommands(
       }
 
       case 'setFillColor': {
-        const c = cmd as SetFillColorCommand;
+        const c = cmd as unknown as SetFillColorCommand;
         ctx.fillStyle = c.color;
         break;
       }
 
       case 'setStrokeColor': {
-        const c = cmd as { type: string; color: string };
+        const c = cmd as unknown as { type: string; color: string };
         ctx.strokeStyle = c.color;
         break;
       }
 
       case 'drawText': {
-        const c = cmd as DrawTextCommand;
+        const c = cmd as unknown as DrawTextCommand;
         ctx.fillText(c.text, c.x, c.y);
         break;
       }
 
       case 'drawTextJustified': {
-        const c = cmd as DrawTextJustifiedCommand;
+        const c = cmd as unknown as DrawTextJustifiedCommand;
         let x = c.x;
         for (let i = 0; i < c.words.length; i++) {
           ctx.fillText(c.words[i], x, c.y);
@@ -250,19 +292,19 @@ export function executeRenderCommands(
       }
 
       case 'fillRect': {
-        const c = cmd as FillRectCommand;
+        const c = cmd as unknown as FillRectCommand;
         ctx.fillRect(c.x, c.y, c.width, c.height);
         break;
       }
 
       case 'strokeRect': {
-        const c = cmd as FillRectCommand;
+        const c = cmd as unknown as FillRectCommand;
         ctx.strokeRect(c.x, c.y, c.width, c.height);
         break;
       }
 
       case 'drawLine': {
-        const c = cmd as DrawLineCommand;
+        const c = cmd as unknown as DrawLineCommand;
         ctx.lineWidth = c.width;
         ctx.beginPath();
         ctx.moveTo(c.x1, c.y1);
@@ -272,7 +314,7 @@ export function executeRenderCommands(
       }
 
       case 'fillCircle': {
-        const c = cmd as FillCircleCommand;
+        const c = cmd as unknown as FillCircleCommand;
         ctx.beginPath();
         ctx.arc(c.x, c.y, c.radius, 0, Math.PI * 2);
         ctx.fill();
@@ -280,7 +322,7 @@ export function executeRenderCommands(
       }
 
       case 'drawImage': {
-        const c = cmd as DrawImageCommand;
+        const c = cmd as unknown as DrawImageCommand;
         const img = loadedImages.get(c.imageId);
         if (img) {
           const srcX = (c.cropLeft / 100) * img.naturalWidth;
@@ -293,21 +335,21 @@ export function executeRenderCommands(
       }
 
       case 'drawCursor': {
-        const c = cmd as DrawCursorCommand;
+        const c = cmd as unknown as DrawCursorCommand;
         ctx.fillStyle = '#000';
         ctx.fillRect(c.x, c.y, 2, c.height);
         break;
       }
 
       case 'drawSelection': {
-        const c = cmd as DrawSelectionCommand;
+        const c = cmd as unknown as DrawSelectionCommand;
         ctx.fillStyle = '#b4d7ff';
         ctx.fillRect(c.x, c.y, c.width, c.height);
         break;
       }
 
       case 'drawPageNumber': {
-        const c = cmd as DrawPageNumberCommand;
+        const c = cmd as unknown as DrawPageNumberCommand;
         ctx.textAlign = 'center';
         ctx.fillText(`${c.number}`, c.x, c.y);
         ctx.textAlign = 'left';
