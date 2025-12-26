@@ -40,7 +40,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlockType, Document, ListType, TextAlign, TextStyle};
+use crate::document::{BlockType, Document, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, TextAlign, TextStyle};
 use crate::layout::{DisplayLine, LayoutConfig};
 
 /// A render command that can be sent to JavaScript for drawing
@@ -124,6 +124,8 @@ pub enum RenderCommand {
     DrawUnderline { x: f64, y: f64, width: f64 },
     /// Draw strikethrough
     DrawStrikethrough { x: f64, y: f64, width: f64 },
+    /// Set global alpha (opacity) for behind/in-front images
+    SetGlobalAlpha { alpha: f64 },
 }
 
 /// A styled text segment for rendering
@@ -241,7 +243,40 @@ fn get_styled_segments(
     segments
 }
 
+/// Calculate image X position based on position mode, alignment and column
+fn calculate_image_x(
+    image: &crate::document::DocumentImage,
+    column_index: usize,
+    config: &LayoutConfig,
+) -> f64 {
+    // For fixed-position images, use the stored X coordinate directly
+    if image.position_mode == ImagePositionMode::FixedPosition {
+        if let Some(x) = image.x {
+            return config.margin_left + x;
+        }
+    }
+
+    // For move-with-text images or fallback, calculate based on alignment
+    let col_offset = column_index as f64 * (config.column_width() + config.column_gap);
+    let clamped_width = image.width.min(config.column_width());
+
+    match image.horizontal_align {
+        HorizontalAlign::Left => config.margin_left + col_offset,
+        HorizontalAlign::Center => {
+            config.margin_left + col_offset + (config.column_width() - clamped_width) / 2.0
+        }
+        HorizontalAlign::Right => {
+            config.margin_left + col_offset + config.column_width() - clamped_width
+        }
+    }
+}
+
 /// Generate render commands for a specific page
+/// Uses multi-pass rendering for proper layering:
+/// 1. Behind images (under text, with reduced opacity)
+/// 2. Float images (square, tight, through - with text wrapping)
+/// 3. Text and inline images
+/// 4. In-front images (over text)
 pub fn generate_render_commands(
     display_lines: &[DisplayLine],
     document: &Document,
@@ -256,8 +291,79 @@ pub fn generate_render_commands(
         .filter(|dl| dl.page_index == page_index)
         .collect();
 
-    // Render each line
-    for dl in page_lines {
+    // ===== PASS 1: Behind images (rendered first, under text) =====
+    commands.push(RenderCommand::SetGlobalAlpha { alpha: 0.5 });
+    for dl in &page_lines {
+        if dl.is_image {
+            if let Some(image_id) = &dl.image_id {
+                if let Some(image) = document.images.iter().find(|img| &img.id == image_id) {
+                    if image.wrap_style == ImageWrapStyle::Behind {
+                        let x = calculate_image_x(image, dl.column_index, config);
+                        let y = if image.position_mode == ImagePositionMode::FixedPosition {
+                            // Fixed position - use absolute Y on this page
+                            if image.page_index == Some(page_index) {
+                                config.margin_top + image.y.unwrap_or(0.0)
+                            } else {
+                                continue; // Not on this page
+                            }
+                        } else {
+                            config.margin_top + dl.y_position
+                        };
+
+                        commands.push(RenderCommand::DrawImage {
+                            image_id: image_id.clone(),
+                            x,
+                            y,
+                            width: image.width.min(config.column_width()),
+                            height: image.cropped_height(),
+                            crop_top: image.crop_top,
+                            crop_right: image.crop_right,
+                            crop_bottom: image.crop_bottom,
+                            crop_left: image.crop_left,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    commands.push(RenderCommand::SetGlobalAlpha { alpha: 1.0 });
+
+    // ===== PASS 2: Float images (square, tight, through) =====
+    for dl in &page_lines {
+        if dl.is_image {
+            if let Some(image_id) = &dl.image_id {
+                if let Some(image) = document.images.iter().find(|img| &img.id == image_id) {
+                    if image.wrap_style.is_float() {
+                        let x = calculate_image_x(image, dl.column_index, config);
+                        let y = if image.position_mode == ImagePositionMode::FixedPosition {
+                            if image.page_index == Some(page_index) {
+                                config.margin_top + image.y.unwrap_or(0.0)
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            config.margin_top + dl.y_position
+                        };
+
+                        commands.push(RenderCommand::DrawImage {
+                            image_id: image_id.clone(),
+                            x,
+                            y,
+                            width: image.width.min(config.column_width()),
+                            height: image.cropped_height(),
+                            crop_top: image.crop_top,
+                            crop_right: image.crop_right,
+                            crop_bottom: image.crop_bottom,
+                            crop_left: image.crop_left,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== PASS 3: Text and inline/top-bottom images =====
+    for dl in &page_lines {
         if dl.is_page_break {
             continue;
         }
@@ -265,23 +371,23 @@ pub fn generate_render_commands(
         if dl.is_image {
             if let Some(image_id) = &dl.image_id {
                 if let Some(image) = document.images.iter().find(|img| &img.id == image_id) {
-                    // Calculate image position
-                    let col_offset =
-                        dl.column_index as f64 * (config.column_width() + config.column_gap);
-                    let x = config.margin_left + col_offset;
-                    let y = config.margin_top + dl.y_position;
+                    // Only render inline and top-bottom images in this pass
+                    if matches!(image.wrap_style, ImageWrapStyle::Inline | ImageWrapStyle::TopBottom) {
+                        let x = calculate_image_x(image, dl.column_index, config);
+                        let y = config.margin_top + dl.y_position;
 
-                    commands.push(RenderCommand::DrawImage {
-                        image_id: image_id.clone(),
-                        x,
-                        y,
-                        width: image.width,
-                        height: image.cropped_height(),
-                        crop_top: image.crop_top,
-                        crop_right: image.crop_right,
-                        crop_bottom: image.crop_bottom,
-                        crop_left: image.crop_left,
-                    });
+                        commands.push(RenderCommand::DrawImage {
+                            image_id: image_id.clone(),
+                            x,
+                            y,
+                            width: image.width.min(config.column_width()),
+                            height: image.cropped_height(),
+                            crop_top: image.crop_top,
+                            crop_right: image.crop_right,
+                            crop_bottom: image.crop_bottom,
+                            crop_left: image.crop_left,
+                        });
+                    }
                 }
             }
             continue;
@@ -317,12 +423,27 @@ pub fn generate_render_commands(
         } else {
             0.0
         };
-        let float_offset = dl
-            .float_reduction
-            .as_ref()
-            .filter(|f| f.side == crate::layout::FloatSide::Left)
-            .map(|f| f.width + 10.0)
-            .unwrap_or(0.0);
+
+        // For floats, text must avoid the float's X region
+        // float_x is relative to column start, we need to offset text accordingly
+        let float_offset = if let Some(ref fr) = dl.float_reduction {
+            // The float occupies X range [float_x, float_x + width]
+            // Text must be outside this range
+            // For left-side floats (or floats starting from x=0): text starts after float
+            // For right-side floats: text ends before float (handled by reduced width)
+
+            // Calculate where the float ends (relative to column start)
+            let float_end_x = fr.float_x + fr.width + 10.0; // 10px gap
+
+            // If float starts near the left edge, offset text to the right
+            if fr.float_x < config.column_width() / 2.0 {
+                float_end_x
+            } else {
+                0.0 // Float is on right side, no left offset needed
+            }
+        } else {
+            0.0
+        };
 
         let text_start_x = config.margin_left + col_offset + list_indent + float_offset;
 
@@ -478,6 +599,40 @@ pub fn generate_render_commands(
 
             // Note: current_x advancement will be handled by JS based on text measurement
             // We're emitting relative positions here
+        }
+    }
+
+    // ===== PASS 4: In-front images (rendered last, over text) =====
+    for dl in &page_lines {
+        if dl.is_image {
+            if let Some(image_id) = &dl.image_id {
+                if let Some(image) = document.images.iter().find(|img| &img.id == image_id) {
+                    if image.wrap_style == ImageWrapStyle::InFront {
+                        let x = calculate_image_x(image, dl.column_index, config);
+                        let y = if image.position_mode == ImagePositionMode::FixedPosition {
+                            if image.page_index == Some(page_index) {
+                                config.margin_top + image.y.unwrap_or(0.0)
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            config.margin_top + dl.y_position
+                        };
+
+                        commands.push(RenderCommand::DrawImage {
+                            image_id: image_id.clone(),
+                            x,
+                            y,
+                            width: image.width.min(config.column_width()),
+                            height: image.cropped_height(),
+                            crop_top: image.crop_top,
+                            crop_right: image.crop_right,
+                            crop_bottom: image.crop_bottom,
+                            crop_left: image.crop_left,
+                        });
+                    }
+                }
+            }
         }
     }
 

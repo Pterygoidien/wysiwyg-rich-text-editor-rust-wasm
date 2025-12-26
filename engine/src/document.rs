@@ -413,8 +413,20 @@ pub enum HorizontalAlign {
     Right,
 }
 
+/// Image position mode - how the image moves with document content
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImagePositionMode {
+    /// Image moves with its anchor paragraph (default)
+    #[default]
+    MoveWithText,
+    /// Image has fixed x,y position on a specific page
+    FixedPosition,
+}
+
 /// An image in the document
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DocumentImage {
     /// Unique identifier
     pub id: String,
@@ -432,6 +444,9 @@ pub struct DocumentImage {
     pub wrap_style: ImageWrapStyle,
     /// Horizontal alignment
     pub horizontal_align: HorizontalAlign,
+    /// Position mode (move-with-text vs fixed-position)
+    #[serde(default)]
+    pub position_mode: ImagePositionMode,
     /// Absolute X position (if positioned)
     pub x: Option<f64>,
     /// Absolute Y position (if positioned)
@@ -456,6 +471,7 @@ impl DocumentImage {
             natural_height: height,
             wrap_style: ImageWrapStyle::Inline,
             horizontal_align: HorizontalAlign::Left,
+            position_mode: ImagePositionMode::MoveWithText,
             x: None,
             y: None,
             page_index: None,

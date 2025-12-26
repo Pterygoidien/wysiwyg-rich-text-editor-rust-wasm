@@ -24,7 +24,8 @@
       "Bash(powershell.exe -Command \"npm run build:wasm 2>&1 | Out-String\")",
       "Bash(powershell.exe -Command \"npm run build 2>&1 | Out-String\")",
       "Bash(wasm-pack build:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(cargo check:*)"
     ]
   }
 }

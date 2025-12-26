@@ -44,7 +44,7 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-use crate::document::{BlockType, Document, ListType, Paragraph};
+use crate::document::{BlockType, Document, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, Paragraph};
 
 /// Configuration for page layout
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +119,7 @@ impl LayoutConfig {
 
 /// A computed display line
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DisplayLine {
     /// Index of the source paragraph
     pub para_index: usize,
@@ -158,9 +159,12 @@ pub struct DisplayLine {
 
 /// Describes width reduction due to a floating image
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FloatReduction {
     pub side: FloatSide,
     pub width: f64,
+    /// X position of the float (relative to column start)
+    pub float_x: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +178,26 @@ pub enum FloatSide {
 #[derive(Debug, Clone)]
 pub struct ActiveFloat {
     pub id: String,
+    /// For move-with-text floats: line indices
     pub start_line: usize,
     pub end_line: usize,
     pub width: f64,
     pub side: FloatSide,
+    /// For positioned floats, the page they're on
+    pub page_index: Option<usize>,
+    /// For fixed-position floats: Y coordinates (relative to margin)
+    pub y_start: Option<f64>,
+    pub y_end: Option<f64>,
+    /// X position of the float (relative to margin, for fixed-position floats)
+    pub x_position: Option<f64>,
+}
+
+/// Convert horizontal alignment to float side
+fn align_to_float_side(align: HorizontalAlign) -> FloatSide {
+    match align {
+        HorizontalAlign::Right => FloatSide::Right,
+        _ => FloatSide::Left,
+    }
 }
 
 /// Text measurement function signature (called from JS)
@@ -192,6 +212,44 @@ pub fn compute_layout(
     let mut display_lines: Vec<DisplayLine> = Vec::new();
     let mut active_floats: Vec<ActiveFloat> = Vec::new();
     let mut list_counters: Vec<usize> = Vec::new();
+
+    // Pre-pass: Collect all images with fixed positions (already positioned floats)
+    // These affect text layout based on their absolute Y position
+    for image in &document.images {
+        if image.wrap_style.is_float()
+            && image.position_mode == ImagePositionMode::FixedPosition
+            && image.y.is_some()
+        {
+            let y = image.y.unwrap();
+            let x = image.x.unwrap_or(0.0);
+            let image_height = image.cropped_height();
+            let image_width = image.width.min(config.column_width());
+
+            // Determine which side the float is on based on its X position
+            // If image center is in left half of column, it's a left float; otherwise right
+            let column_width = config.column_width();
+            let image_center = x + image_width / 2.0;
+            let side = if image_center < column_width / 2.0 {
+                FloatSide::Left
+            } else {
+                FloatSide::Right
+            };
+
+            // Store Y coordinates for fixed-position floats
+            // These will be checked against line Y positions during layout
+            active_floats.push(ActiveFloat {
+                id: image.id.clone(),
+                start_line: 0, // Not used for fixed-position
+                end_line: 0,   // Not used for fixed-position
+                width: image_width,
+                side,
+                page_index: image.page_index,
+                y_start: Some(y),
+                y_end: Some(y + image_height),
+                x_position: Some(x),
+            });
+        }
+    }
 
     // First pass: Generate display lines for each paragraph
     for (para_idx, para) in document.paragraphs.iter().enumerate() {
@@ -253,23 +311,40 @@ fn layout_paragraph(
     // Handle image paragraphs
     if let Some(image_id) = para.image_id() {
         if let Some(image) = document.images.iter().find(|img| img.id == image_id) {
-            // Check if this is a float image
-            if image.wrap_style.is_float() && image.y.is_none() {
-                // Register as active float
-                let side = match image.horizontal_align {
-                    crate::document::HorizontalAlign::Right => FloatSide::Right,
-                    _ => FloatSide::Left,
-                };
-                let image_lines = (image.cropped_height() / config.line_height_px()).ceil() as usize;
+            let clamped_width = image.width.min(config.column_width());
+            let line_height = config.line_height_px();
+            let image_height = image.cropped_height();
+
+            // For float reduction: count all lines that overlap with the image
+            // A line at Y overlaps if Y < image_height (its top is within the image bounds)
+            // Use ceil() to include any line that has partial overlap
+            let float_lines = if image_height <= 0.0 {
+                0
+            } else {
+                (image_height / line_height).ceil() as usize
+            };
+
+            // For inline/top-bottom images: use ceil() for vertical space (image occupies full lines)
+            let inline_image_lines = (image_height / line_height).ceil();
+
+            // Check if this is a float image in move-with-text mode
+            if image.wrap_style.is_float() && image.position_mode == ImagePositionMode::MoveWithText {
+                // Register as active float for text lines that overlap with the image
+                // start_line is current_line_count + 1 because the marker at current_line_count
+                // has zero height and doesn't need reduction. Text starts at the next line.
                 active_floats.push(ActiveFloat {
                     id: image_id.to_string(),
-                    start_line: current_line_count,
-                    end_line: current_line_count + image_lines,
-                    width: image.width,
-                    side,
+                    start_line: current_line_count + 1,
+                    end_line: current_line_count + 1 + float_lines,
+                    width: clamped_width,
+                    side: align_to_float_side(image.horizontal_align),
+                    page_index: None, // Will be determined during page assignment
+                    y_start: None,    // Line-index based, not Y-based
+                    y_end: None,
+                    x_position: None, // Will be calculated based on alignment during layout
                 });
 
-                // Float images don't create visible display lines
+                // Float images create a zero-height marker line
                 return vec![DisplayLine {
                     para_index: para_idx,
                     start_offset: 0,
@@ -282,7 +357,7 @@ fn layout_paragraph(
                     is_page_break: false,
                     is_image: true,
                     image_id: Some(image_id.to_string()),
-                    image_height: Some(0.0), // Zero height for float
+                    image_height: Some(0.0), // Zero height for float - doesn't take up space
                     list_number: None,
                     is_last_line: true,
                     block_type: meta.block_type,
@@ -291,8 +366,54 @@ fn layout_paragraph(
                 }];
             }
 
-            // Non-float image
-            let image_lines = (image.cropped_height() / config.line_height_px()).ceil();
+            // Check if this is a positioned float (already handled in pre-pass)
+            if image.wrap_style.is_float() && image.position_mode == ImagePositionMode::FixedPosition {
+                // Already registered in pre-pass, just create marker line
+                return vec![DisplayLine {
+                    para_index: para_idx,
+                    start_offset: 0,
+                    end_offset: para.text.len(),
+                    text: String::new(),
+                    page_index: 0,
+                    column_index: 0,
+                    x_position: 0.0,
+                    y_position: 0.0,
+                    is_page_break: false,
+                    is_image: true,
+                    image_id: Some(image_id.to_string()),
+                    image_height: Some(0.0), // Zero height - position is absolute
+                    list_number: None,
+                    is_last_line: true,
+                    block_type: meta.block_type,
+                    list_type: ListType::None,
+                    float_reduction: None,
+                }];
+            }
+
+            // Behind/in-front images don't affect text flow
+            if matches!(image.wrap_style, ImageWrapStyle::Behind | ImageWrapStyle::InFront) {
+                return vec![DisplayLine {
+                    para_index: para_idx,
+                    start_offset: 0,
+                    end_offset: para.text.len(),
+                    text: String::new(),
+                    page_index: 0,
+                    column_index: 0,
+                    x_position: 0.0,
+                    y_position: 0.0,
+                    is_page_break: false,
+                    is_image: true,
+                    image_id: Some(image_id.to_string()),
+                    image_height: Some(0.0), // Zero height - doesn't affect text flow
+                    list_number: None,
+                    is_last_line: true,
+                    block_type: meta.block_type,
+                    list_type: ListType::None,
+                    float_reduction: None,
+                }];
+            }
+
+            // Inline or top-bottom image: takes up vertical space
             return vec![DisplayLine {
                 para_index: para_idx,
                 start_offset: 0,
@@ -305,7 +426,7 @@ fn layout_paragraph(
                 is_page_break: false,
                 is_image: true,
                 image_id: Some(image_id.to_string()),
-                image_height: Some(image_lines),
+                image_height: Some(inline_image_lines),
                 list_number: None,
                 is_last_line: true,
                 block_type: meta.block_type,
@@ -333,7 +454,7 @@ fn layout_paragraph(
         }
     };
 
-    // Calculate available width
+    // Calculate base formatting
     let font_size = meta.font_size.unwrap_or(config.font_size)
         * meta.block_type.font_size_multiplier();
     let list_indent = if meta.list_type != ListType::None {
@@ -341,16 +462,15 @@ fn layout_paragraph(
     } else {
         0.0
     };
-
-    // Check for active floats affecting this line
-    let float_reduction = get_float_reduction(active_floats, current_line_count);
-    let float_width = float_reduction.as_ref().map(|f| f.width + 10.0).unwrap_or(0.0);
-
-    let available_width = config.column_width() - list_indent - float_width;
+    let base_available_width = config.column_width() - list_indent;
 
     // Wrap the paragraph text
     let text = &para.text;
+    let line_height = config.line_height_px();
+    let column_width = config.column_width();
     if text.is_empty() {
+        let estimated_y = current_line_count as f64 * line_height;
+        let float_reduction = get_float_reduction(active_floats, current_line_count, estimated_y, line_height, column_width);
         return vec![DisplayLine {
             para_index: para_idx,
             start_offset: 0,
@@ -372,11 +492,18 @@ fn layout_paragraph(
         }];
     }
 
-    // Word wrap the text
+    // Word wrap the text with per-line float checking
     let mut lines: Vec<DisplayLine> = Vec::new();
     let mut current_start = 0;
 
     while current_start < text.len() {
+        // Check for active floats affecting THIS line (not the first line)
+        let line_index = current_line_count + lines.len();
+        let estimated_y = line_index as f64 * line_height;
+        let float_reduction = get_float_reduction(active_floats, line_index, estimated_y, line_height, column_width);
+        let float_width = float_reduction.as_ref().map(|f| f.width + 10.0).unwrap_or(0.0);
+        let available_width = base_available_width - float_width;
+
         let remaining = &text[current_start..];
 
         // Measure remaining text
@@ -401,7 +528,7 @@ fn layout_paragraph(
                 is_last_line: true,
                 block_type: meta.block_type,
                 list_type: meta.list_type,
-                float_reduction: float_reduction.clone(),
+                float_reduction,
             });
             break;
         }
@@ -469,14 +596,48 @@ fn layout_paragraph(
     lines
 }
 
-/// Get float reduction for a given line index
-fn get_float_reduction(floats: &[ActiveFloat], line_index: usize) -> Option<FloatReduction> {
+/// Get float reduction for a given line
+///
+/// For move-with-text floats: uses line_index to check overlap
+/// For fixed-position floats: uses estimated_y to check Y-based overlap
+///
+/// Returns the float reduction including the X position of the float
+fn get_float_reduction(
+    floats: &[ActiveFloat],
+    line_index: usize,
+    estimated_y: f64,
+    line_height: f64,
+    column_width: f64,
+) -> Option<FloatReduction> {
     for float in floats {
-        if line_index >= float.start_line && line_index < float.end_line {
-            return Some(FloatReduction {
-                side: float.side,
-                width: float.width,
-            });
+        // Check Y-based overlap for fixed-position floats
+        if let (Some(y_start), Some(y_end)) = (float.y_start, float.y_end) {
+            // Line occupies Y range [estimated_y, estimated_y + line_height)
+            // Float occupies Y range [y_start, y_end)
+            // They overlap if: estimated_y < y_end AND estimated_y + line_height > y_start
+            if estimated_y < y_end && estimated_y + line_height > y_start {
+                // For fixed-position floats, use stored X position
+                let float_x = float.x_position.unwrap_or(0.0);
+                return Some(FloatReduction {
+                    side: float.side,
+                    width: float.width,
+                    float_x,
+                });
+            }
+        } else {
+            // Line-index based overlap for move-with-text floats
+            if line_index >= float.start_line && line_index < float.end_line {
+                // For move-with-text floats, calculate X based on side
+                let float_x = match float.side {
+                    FloatSide::Left => 0.0,
+                    FloatSide::Right => column_width - float.width,
+                };
+                return Some(FloatReduction {
+                    side: float.side,
+                    width: float.width,
+                    float_x,
+                });
+            }
         }
     }
     None
@@ -510,8 +671,8 @@ fn assign_page_positions(display_lines: &mut [DisplayLine], config: &LayoutConfi
             line_height
         };
 
-        // Add paragraph spacing if last line
-        let spacing_after = if dl.is_last_line {
+        // Add paragraph spacing if last line, but not for zero-height image markers
+        let spacing_after = if dl.is_last_line && this_line_height > 0.0 {
             config.paragraph_spacing
         } else {
             0.0

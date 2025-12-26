@@ -115,6 +115,11 @@ export interface DrawStrikethroughCommand {
   width: number;
 }
 
+export interface SetGlobalAlphaCommand {
+  type: 'setGlobalAlpha';
+  alpha: number;
+}
+
 // Position mapping result types
 export interface DisplayPosition {
   line: number;
@@ -208,6 +213,12 @@ export interface Engine {
   // List functions
   get_list_type(index: number): string;
   insert_paragraph_with_list(index: number, text: string, sourcePara: number): void;
+
+  // Image layout functions
+  set_image_wrap_style(id: string, wrapStyle: string): void;
+  set_image_position(id: string, x: number, y: number, pageIndex: number): void;
+  clear_image_position(id: string): void;
+  set_image_horizontal_align(id: string, align: string): void;
 }
 
 /**
@@ -467,6 +478,12 @@ export function executeRenderCommands(
         ctx.textAlign = 'center';
         ctx.fillText(`${c.number}`, c.x, c.y);
         ctx.textAlign = 'left';
+        break;
+      }
+
+      case 'setGlobalAlpha': {
+        const c = cmd as unknown as SetGlobalAlphaCommand;
+        ctx.globalAlpha = c.alpha;
         break;
       }
     }

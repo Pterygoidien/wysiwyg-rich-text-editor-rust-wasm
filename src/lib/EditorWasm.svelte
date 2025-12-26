@@ -6,6 +6,18 @@
   import { pageConfig, fontSize, lineHeight, letterSpacing, paragraphSpacing, fontFamily, zoomLevel } from './stores';
   import { getPageDimensions, getContentDimensions, mmToPixels } from './types';
 
+  // Special markers used by the engine
+  const IMAGE_MARKER = '\u{FFFC}';  // Object replacement character
+  const PAGE_BREAK_MARKER = '\u{FFFD}';  // Replacement character
+
+  /**
+   * Check if a paragraph is a special paragraph (image or page break)
+   * that shouldn't be directly edited
+   */
+  function isSpecialParagraph(text: string): boolean {
+    return text.startsWith(IMAGE_MARKER) || text === PAGE_BREAK_MARKER;
+  }
+
   let pageCanvases: HTMLCanvasElement[] = [];
   let pagesContainer: HTMLDivElement;
   let measureCanvas: HTMLCanvasElement;
@@ -72,6 +84,69 @@
   // Mouse drag selection state
   let isMouseDown = $state(false);
   let mouseDownPage = $state(0);
+
+  // Image selection and dragging state
+  let selectedImageId = $state<string | null>(null);
+  let showImageOptions = $state(false);
+  let imageOptionsPosition = $state({ x: 0, y: 0 });
+  let isDraggingImage = $state(false);
+  let dragStartPos = $state({ x: 0, y: 0 });
+  let dragImageStartPos = $state({ x: 0, y: 0 });
+  let dragImagePage = $state(0);
+
+  // Image resize state
+  type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se' | 'n' | 's' | 'e' | 'w' | null;
+  let isResizing = $state(false);
+  let resizeHandle: ResizeHandle = $state(null);
+  let resizeStartX = $state(0);
+  let resizeStartY = $state(0);
+  let resizeStartWidth = $state(0);
+  let resizeStartHeight = $state(0);
+
+  // Image crop state
+  let isCropping = $state(false);
+  let cropHandle: ResizeHandle = $state(null);
+  let cropStartX = $state(0);
+  let cropStartY = $state(0);
+  let cropStartValues = $state({ top: 0, right: 0, bottom: 0, left: 0 });
+  let cropOriginalValues = $state({ top: 0, right: 0, bottom: 0, left: 0 });
+
+  // Get resize cursor based on handle
+  function getResizeCursor(handle: ResizeHandle): string {
+    switch (handle) {
+      case 'nw':
+      case 'se':
+        return 'nwse-resize';
+      case 'ne':
+      case 'sw':
+        return 'nesw-resize';
+      case 'n':
+      case 's':
+        return 'ns-resize';
+      case 'e':
+      case 'w':
+        return 'ew-resize';
+      default:
+        return 'default';
+    }
+  }
+
+  // Cursor style based on current operation
+  let canvasCursor = $derived.by(() => {
+    if (isResizing && resizeHandle) {
+      return getResizeCursor(resizeHandle);
+    }
+    if (isCropping && cropHandle) {
+      return getResizeCursor(cropHandle);
+    }
+    if (isDraggingImage) {
+      return 'move';
+    }
+    if (selectedImageId) {
+      return 'default';
+    }
+    return 'text';
+  });
 
   /**
    * Save current state to undo stack
@@ -426,8 +501,14 @@
 
     const id = generateImageId();
 
-    // Calculate display size (max width within margins, maintain aspect ratio)
-    const maxWidth = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+    // Calculate max width based on column layout
+    const contentWidth = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+    const columnWidth = COLUMNS > 1
+      ? (contentWidth - (COLUMNS - 1) * COLUMN_GAP) / COLUMNS
+      : contentWidth;
+    const maxWidth = columnWidth;
+
+    // Calculate display size (max width within column, maintain aspect ratio)
     let width = img.naturalWidth;
     let height = img.naturalHeight;
 
@@ -445,16 +526,545 @@
     // The img passed to this function is already loaded (via onload callback)
     loadedImages.set(id, img);
 
+    // Split current paragraph at cursor position
+    const currentText = engine.get_paragraph(cursorPara) || '';
+    const beforeCursor = currentText.slice(0, cursorOffset);
+    const afterCursor = currentText.slice(cursorOffset);
+
+    // Update current paragraph with text before cursor
+    engine.set_paragraph(cursorPara, beforeCursor);
+
     // Insert image paragraph after current paragraph
     engine.insert_image_paragraph(cursorPara + 1, id);
 
+    // Insert a new paragraph with text after cursor (after the image)
+    engine.insert_paragraph(cursorPara + 2, afterCursor);
+
     console.log(`Image paragraph inserted at index ${cursorPara + 1}, loadedImages has ${loadedImages.size} entries`);
 
-    // Move cursor to after the image
-    cursorPara += 1;
+    // Move cursor to the paragraph AFTER the image (not on the image itself)
+    cursorPara += 2;
     cursorOffset = 0;
 
     recomputeAndRender();
+  }
+
+  /**
+   * Get image info at a click position
+   */
+  function getImageAtPosition(pageIdx: number, x: number, y: number): { id: string; x: number; y: number; width: number; height: number } | null {
+    if (!engine) return null;
+
+    const displayLinesJson = engine.get_display_lines_json();
+    try {
+      const displayLines = JSON.parse(displayLinesJson);
+      // Fields are now camelCase from Rust
+      const linesOnPage = displayLines.filter((dl: { pageIndex: number }) => dl.pageIndex === pageIdx);
+
+      for (const line of linesOnPage) {
+        if (line.isImage && line.imageId) {
+          const imageJson = engine.get_image(line.imageId);
+          if (imageJson) {
+            const image = JSON.parse(imageJson);
+            const imgY = MARGIN_TOP + line.yPosition;
+            const imgX = line.xPosition || MARGIN_LEFT;
+            const imgWidth = Math.min(image.width, PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT);
+            const imgHeight = image.height * ((100 - image.cropTop - image.cropBottom) / 100);
+
+            // Check if click is within image bounds
+            if (x >= imgX && x <= imgX + imgWidth && y >= imgY && y <= imgY + imgHeight) {
+              return {
+                id: line.imageId,
+                x: imgX,
+                y: imgY,
+                width: imgWidth,
+                height: imgHeight
+              };
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to get image at position:', e);
+    }
+    return null;
+  }
+
+  /**
+   * Select an image and show options popup
+   */
+  function selectImage(imageId: string, pageIdx: number, x: number, y: number) {
+    selectedImageId = imageId;
+    showImageOptions = true;
+    // Position popup near the image
+    const canvas = pageCanvases[pageIdx];
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const zoomFactor = ZOOM / 100;
+      imageOptionsPosition = {
+        x: rect.left + x * zoomFactor,
+        y: rect.top + y * zoomFactor + 10
+      };
+    }
+  }
+
+  /**
+   * Deselect image and hide options
+   */
+  function deselectImage() {
+    selectedImageId = null;
+    showImageOptions = false;
+    renderAllPages();
+  }
+
+  /**
+   * Set wrap style for selected image
+   */
+  function setImageWrapStyle(wrapStyle: string) {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+    engine.set_image_wrap_style(selectedImageId, wrapStyle);
+    recomputeAndRender();
+  }
+
+  /**
+   * Set horizontal alignment for selected image
+   */
+  function setImageAlign(align: string) {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+    engine.set_image_horizontal_align(selectedImageId, align);
+    recomputeAndRender();
+  }
+
+  /**
+   * Clear image position (reset to move-with-text)
+   */
+  function resetImagePosition() {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+    engine.clear_image_position(selectedImageId);
+    recomputeAndRender();
+  }
+
+  /**
+   * Delete the selected image
+   */
+  function deleteSelectedImage() {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+
+    // Find and delete the paragraph containing this image
+    const paraCount = engine.paragraph_count();
+    for (let i = 0; i < paraCount; i++) {
+      const text = engine.get_paragraph(i) || '';
+      if (text.startsWith('\uFFFC') && text.slice(1) === selectedImageId) {
+        engine.delete_paragraph(i);
+        break;
+      }
+    }
+
+    // Delete the image itself
+    engine.delete_image(selectedImageId);
+    loadedImages.delete(selectedImageId);
+
+    deselectImage();
+    recomputeAndRender();
+  }
+
+  /**
+   * Handle image drag start
+   */
+  function startImageDrag(pageIdx: number, mouseX: number, mouseY: number, imgX: number, imgY: number) {
+    isDraggingImage = true;
+    dragStartPos = { x: mouseX, y: mouseY };
+    dragImageStartPos = { x: imgX, y: imgY };
+    dragImagePage = pageIdx;
+  }
+
+  /**
+   * Handle image drag move
+   */
+  function handleImageDrag(pageIdx: number, mouseX: number, mouseY: number) {
+    if (!isDraggingImage || !engine || !selectedImageId) return;
+
+    const deltaX = mouseX - dragStartPos.x;
+    const deltaY = mouseY - dragStartPos.y;
+
+    const newX = dragImageStartPos.x + deltaX - MARGIN_LEFT;
+    const newY = dragImageStartPos.y + deltaY - MARGIN_TOP;
+
+    // Update image position (converts to fixed-position mode)
+    engine.set_image_position(selectedImageId, newX, newY, pageIdx);
+    recomputeAndRender();
+  }
+
+  /**
+   * Handle image drag end
+   */
+  function endImageDrag() {
+    if (isDraggingImage) {
+      isDraggingImage = false;
+    }
+  }
+
+  /**
+   * Get bounds for the currently selected image
+   */
+  function getSelectedImageBounds(): { x: number; y: number; width: number; height: number; pageIndex: number } | null {
+    if (!engine || !selectedImageId) return null;
+
+    const displayLinesJson = engine.get_display_lines_json();
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return null;
+
+    const image = JSON.parse(imageJson);
+    const columnWidth = (PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT - (COLUMNS - 1) * COLUMN_GAP) / COLUMNS;
+    const imgWidth = Math.min(image.width, columnWidth);
+    const imgHeight = image.height * ((100 - (image.cropTop || 0) - (image.cropBottom || 0)) / 100);
+
+    // Check if image has fixed position (after dragging)
+    if (image.positionMode === 'fixed-position' && image.x != null && image.y != null && image.pageIndex != null) {
+      // Use the fixed position directly (image.x/y are relative to margins, so add them back)
+      return {
+        x: MARGIN_LEFT + image.x,
+        y: MARGIN_TOP + image.y,
+        width: imgWidth,
+        height: imgHeight,
+        pageIndex: image.pageIndex
+      };
+    }
+
+    // For move-with-text images, find the display line position
+    try {
+      const displayLines = JSON.parse(displayLinesJson);
+      const imageLine = displayLines.find((dl: { isImage: boolean; imageId: string }) =>
+        dl.isImage && dl.imageId === selectedImageId
+      );
+
+      if (!imageLine) return null;
+
+      const imgY = MARGIN_TOP + imageLine.yPosition;
+      const columnOffset = imageLine.columnIndex * (columnWidth + COLUMN_GAP);
+
+      // Calculate X position based on horizontal alignment (matching render.rs calculate_image_x)
+      let imgX: number;
+      const horizontalAlign = image.horizontalAlign || 'left';
+      switch (horizontalAlign) {
+        case 'center':
+          imgX = MARGIN_LEFT + columnOffset + (columnWidth - imgWidth) / 2;
+          break;
+        case 'right':
+          imgX = MARGIN_LEFT + columnOffset + columnWidth - imgWidth;
+          break;
+        case 'left':
+        default:
+          imgX = MARGIN_LEFT + columnOffset;
+          break;
+      }
+
+      return {
+        x: imgX,
+        y: imgY,
+        width: imgWidth,
+        height: imgHeight,
+        pageIndex: imageLine.pageIndex
+      };
+    } catch (e) {
+      console.error('Failed to get image bounds:', e);
+      return null;
+    }
+  }
+
+  /**
+   * Check if a point is on a resize handle
+   */
+  function getResizeHandleAtPoint(x: number, y: number, bounds: { x: number; y: number; width: number; height: number }): ResizeHandle {
+    const handleSize = 10;
+    const { x: bx, y: by, width: bw, height: bh } = bounds;
+
+    // Check corners
+    if (x >= bx - handleSize && x <= bx + handleSize && y >= by - handleSize && y <= by + handleSize) return 'nw';
+    if (x >= bx + bw - handleSize && x <= bx + bw + handleSize && y >= by - handleSize && y <= by + handleSize) return 'ne';
+    if (x >= bx - handleSize && x <= bx + handleSize && y >= by + bh - handleSize && y <= by + bh + handleSize) return 'sw';
+    if (x >= bx + bw - handleSize && x <= bx + bw + handleSize && y >= by + bh - handleSize && y <= by + bh + handleSize) return 'se';
+
+    // Check edges (middle of each side)
+    const midX = bx + bw / 2;
+    const midY = by + bh / 2;
+    if (x >= midX - handleSize && x <= midX + handleSize && y >= by - handleSize && y <= by + handleSize) return 'n';
+    if (x >= midX - handleSize && x <= midX + handleSize && y >= by + bh - handleSize && y <= by + bh + handleSize) return 's';
+    if (x >= bx - handleSize && x <= bx + handleSize && y >= midY - handleSize && y <= midY + handleSize) return 'w';
+    if (x >= bx + bw - handleSize && x <= bx + bw + handleSize && y >= midY - handleSize && y <= midY + handleSize) return 'e';
+
+    return null;
+  }
+
+  /**
+   * Start resizing an image
+   */
+  function startResize(handle: ResizeHandle, clientX: number, clientY: number) {
+    if (!engine || !selectedImageId || !handle) return;
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return;
+
+    const image = JSON.parse(imageJson);
+
+    isResizing = true;
+    resizeHandle = handle;
+    resizeStartX = clientX;
+    resizeStartY = clientY;
+    resizeStartWidth = image.width;
+    resizeStartHeight = image.height;
+    showImageOptions = false;
+  }
+
+  /**
+   * Handle resize move
+   */
+  function handleResizeMove(clientX: number, clientY: number) {
+    if (!engine || !isResizing || !selectedImageId || !resizeHandle) return;
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return;
+
+    const image = JSON.parse(imageJson);
+    const aspectRatio = image.naturalWidth / image.naturalHeight;
+
+    const zoomFactor = ZOOM / 100;
+    const deltaX = (clientX - resizeStartX) / zoomFactor;
+    const deltaY = (clientY - resizeStartY) / zoomFactor;
+
+    let newWidth = resizeStartWidth;
+    let newHeight = resizeStartHeight;
+
+    // Calculate new dimensions based on handle
+    switch (resizeHandle) {
+      case 'se':
+        newWidth = Math.max(50, resizeStartWidth + deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'sw':
+        newWidth = Math.max(50, resizeStartWidth - deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'ne':
+        newWidth = Math.max(50, resizeStartWidth + deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'nw':
+        newWidth = Math.max(50, resizeStartWidth - deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'e':
+        newWidth = Math.max(50, resizeStartWidth + deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'w':
+        newWidth = Math.max(50, resizeStartWidth - deltaX);
+        newHeight = newWidth / aspectRatio;
+        break;
+      case 'n':
+      case 's':
+        newHeight = Math.max(50, resizeStartHeight + (resizeHandle === 's' ? deltaY : -deltaY));
+        newWidth = newHeight * aspectRatio;
+        break;
+    }
+
+    // Constrain to max content width
+    const maxWidth = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT;
+    if (newWidth > maxWidth) {
+      newWidth = maxWidth;
+      newHeight = newWidth / aspectRatio;
+    }
+
+    engine.update_image_size(selectedImageId, newWidth, newHeight);
+    recomputeAndRender();
+  }
+
+  /**
+   * End resizing
+   */
+  function endResize() {
+    isResizing = false;
+    resizeHandle = null;
+  }
+
+  /**
+   * Start cropping mode
+   */
+  function startCropMode() {
+    if (!engine || !selectedImageId) return;
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return;
+
+    const image = JSON.parse(imageJson);
+    cropOriginalValues = {
+      top: image.cropTop || 0,
+      right: image.cropRight || 0,
+      bottom: image.cropBottom || 0,
+      left: image.cropLeft || 0,
+    };
+
+    isCropping = true;
+    showImageOptions = false;
+    renderAllPages();
+  }
+
+  /**
+   * End cropping mode
+   */
+  function endCropMode() {
+    isCropping = false;
+    cropHandle = null;
+    renderAllPages();
+  }
+
+  /**
+   * Cancel crop and restore original values
+   */
+  function cancelCrop() {
+    if (!engine || !selectedImageId) return;
+
+    // Restore original crop values via engine
+    // For now, just end cropping mode - full crop support would need API update
+    endCropMode();
+  }
+
+  /**
+   * Reset crop values to zero
+   */
+  function resetCrop() {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return;
+
+    const image = JSON.parse(imageJson);
+    // Reset all crop values to 0 by updating the image
+    // We need to update crop through the engine - for now we can use the existing methods
+    // This would require an add_image call with original dimensions
+    // For now, just reset the display
+    cropOriginalValues = { top: 0, right: 0, bottom: 0, left: 0 };
+    recomputeAndRender();
+  }
+
+  /**
+   * Get the selected image data
+   */
+  function getSelectedImageData(): { wrapStyle: string; horizontalAlign: string; positionMode: string } | null {
+    if (!engine || !selectedImageId) return null;
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return null;
+
+    try {
+      const image = JSON.parse(imageJson);
+      return {
+        wrapStyle: image.wrapStyle || 'inline',
+        horizontalAlign: image.horizontalAlign || 'left',
+        positionMode: image.positionMode || 'move-with-text',
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Set the image position mode
+   */
+  function setImagePositionMode(mode: string) {
+    if (!engine || !selectedImageId) return;
+    saveUndoState();
+    if (mode === 'move-with-text') {
+      engine.clear_image_position(selectedImageId);
+    }
+    // Fixed position is handled by dragging
+    recomputeAndRender();
+  }
+
+  /**
+   * Close image options popup
+   */
+  function closeImageOptionsPopup() {
+    showImageOptions = false;
+  }
+
+  /**
+   * Start crop drag
+   */
+  function startCropDrag(handle: ResizeHandle, clientX: number, clientY: number) {
+    if (!engine || !selectedImageId || !handle) return;
+
+    const imageJson = engine.get_image(selectedImageId);
+    if (!imageJson) return;
+
+    const image = JSON.parse(imageJson);
+
+    cropHandle = handle;
+    cropStartX = clientX;
+    cropStartY = clientY;
+    cropStartValues = {
+      top: image.cropTop || 0,
+      right: image.cropRight || 0,
+      bottom: image.cropBottom || 0,
+      left: image.cropLeft || 0,
+    };
+  }
+
+  /**
+   * Handle crop move - Note: Full crop implementation would need engine support
+   */
+  function handleCropMove(_clientX: number, _clientY: number) {
+    // Crop functionality would require updating the image crop values in the engine
+    // This is a placeholder - the actual implementation would need engine API updates
+    if (!isCropping || !selectedImageId || !cropHandle) return;
+  }
+
+  /**
+   * End crop drag
+   */
+  function endCropDrag() {
+    cropHandle = null;
+  }
+
+  /**
+   * Draw resize handles on a selected image
+   */
+  function drawResizeHandles(ctx: CanvasRenderingContext2D, bounds: { x: number; y: number; width: number; height: number }) {
+    const handleSize = 8;
+    const { x, y, width, height } = bounds;
+
+    ctx.fillStyle = isCropping ? '#ff9800' : '#1a73e8';
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+
+    // Define handle positions
+    const handles = [
+      { x: x, y: y }, // nw
+      { x: x + width, y: y }, // ne
+      { x: x, y: y + height }, // sw
+      { x: x + width, y: y + height }, // se
+      { x: x + width / 2, y: y }, // n
+      { x: x + width / 2, y: y + height }, // s
+      { x: x, y: y + height / 2 }, // w
+      { x: x + width, y: y + height / 2 }, // e
+    ];
+
+    for (const handle of handles) {
+      ctx.fillRect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
+      ctx.strokeRect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
+    }
+
+    // Draw selection border
+    ctx.strokeStyle = isCropping ? '#ff9800' : '#1a73e8';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    ctx.strokeRect(x, y, width, height);
+    ctx.setLineDash([]);
   }
 
   /**
@@ -842,6 +1452,14 @@
     if (pageIdx === currentPage) {
       drawCursor(ctx);
     }
+
+    // Draw resize handles if an image is selected on this page
+    if (selectedImageId) {
+      const bounds = getSelectedImageBounds();
+      if (bounds && bounds.pageIndex === pageIdx) {
+        drawResizeHandles(ctx, bounds);
+      }
+    }
   }
 
   function render() {
@@ -976,7 +1594,7 @@
 
       // Measure text width from line start to cursor offset
       const paraText = engine.get_paragraph(cursorPara) || '';
-      const textBefore = paraText.substring(line.start_offset, cursorOffset);
+      const textBefore = paraText.substring(line.startOffset, cursorOffset);
 
       ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
       const textWidth = ctx.measureText(textBefore).width;
@@ -1276,6 +1894,30 @@
     }
 
     const text = engine.get_paragraph(cursorPara) || '';
+
+    // If on a special paragraph (image/page break), move to next paragraph first
+    if (isSpecialParagraph(text)) {
+      // Move to next paragraph, or create one if at end
+      if (cursorPara < engine.paragraph_count() - 1) {
+        cursorPara++;
+        cursorOffset = 0;
+        // Insert at beginning of next paragraph
+        const nextText = engine.get_paragraph(cursorPara) || '';
+        if (!isSpecialParagraph(nextText)) {
+          engine.set_paragraph(cursorPara, char + nextText);
+          cursorOffset = 1;
+          recomputeAndRender();
+          return;
+        }
+      }
+      // If next is also special, create a new paragraph
+      engine.insert_paragraph(cursorPara + 1, char);
+      cursorPara++;
+      cursorOffset = 1;
+      recomputeAndRender();
+      return;
+    }
+
     const newText = text.slice(0, cursorOffset) + char + text.slice(cursorOffset);
     engine.set_paragraph(cursorPara, newText);
     cursorOffset++;
@@ -1295,15 +1937,53 @@
       return;
     }
 
+    const text = engine.get_paragraph(cursorPara) || '';
+
+    // If on a special paragraph, select the image or delete the page break
+    if (isSpecialParagraph(text)) {
+      if (text.startsWith(IMAGE_MARKER)) {
+        // Select the image for deletion
+        const imageId = text.substring(1);
+        selectedImageId = imageId;
+        showImageOptions = true;
+        renderAllPages();
+      } else {
+        // Delete page break
+        engine.delete_paragraph(cursorPara);
+        if (cursorPara > 0) {
+          cursorPara--;
+          cursorOffset = (engine.get_paragraph(cursorPara) || '').length;
+        }
+        recomputeAndRender();
+      }
+      return;
+    }
+
     if (cursorOffset > 0) {
-      const text = engine.get_paragraph(cursorPara) || '';
       const newText = text.slice(0, cursorOffset - 1) + text.slice(cursorOffset);
       engine.set_paragraph(cursorPara, newText);
       cursorOffset--;
     } else if (cursorPara > 0) {
-      // Merge with previous paragraph
+      // Check if previous paragraph is special
       const prevText = engine.get_paragraph(cursorPara - 1) || '';
-      const currText = engine.get_paragraph(cursorPara) || '';
+      if (isSpecialParagraph(prevText)) {
+        if (prevText.startsWith(IMAGE_MARKER)) {
+          // Select the image for deletion
+          const imageId = prevText.substring(1);
+          selectedImageId = imageId;
+          showImageOptions = true;
+          renderAllPages();
+          return;
+        } else {
+          // Delete page break
+          engine.delete_paragraph(cursorPara - 1);
+          cursorPara--;
+          recomputeAndRender();
+          return;
+        }
+      }
+      // Merge with previous paragraph
+      const currText = text;
       engine.set_paragraph(cursorPara - 1, prevText + currText);
       engine.delete_paragraph(cursorPara);
       cursorPara--;
@@ -1327,12 +2007,44 @@
 
     const text = engine.get_paragraph(cursorPara) || '';
 
+    // If on a special paragraph, select the image or delete the page break
+    if (isSpecialParagraph(text)) {
+      if (text.startsWith(IMAGE_MARKER)) {
+        // Select the image for deletion
+        const imageId = text.substring(1);
+        selectedImageId = imageId;
+        showImageOptions = true;
+        renderAllPages();
+      } else {
+        // Delete page break
+        engine.delete_paragraph(cursorPara);
+        recomputeAndRender();
+      }
+      return;
+    }
+
     if (cursorOffset < text.length) {
       const newText = text.slice(0, cursorOffset) + text.slice(cursorOffset + 1);
       engine.set_paragraph(cursorPara, newText);
     } else if (cursorPara < engine.paragraph_count() - 1) {
-      // Merge with next paragraph
+      // Check if next paragraph is special
       const nextText = engine.get_paragraph(cursorPara + 1) || '';
+      if (isSpecialParagraph(nextText)) {
+        if (nextText.startsWith(IMAGE_MARKER)) {
+          // Select the image for deletion
+          const imageId = nextText.substring(1);
+          selectedImageId = imageId;
+          showImageOptions = true;
+          renderAllPages();
+          return;
+        } else {
+          // Delete page break
+          engine.delete_paragraph(cursorPara + 1);
+          recomputeAndRender();
+          return;
+        }
+      }
+      // Merge with next paragraph
       engine.set_paragraph(cursorPara, text + nextText);
       engine.delete_paragraph(cursorPara + 1);
     }
@@ -1460,12 +2172,13 @@
     const displayLinesJson = engine.get_display_lines_json();
     try {
       const displayLines = JSON.parse(displayLinesJson);
-      const linesOnPage = displayLines.filter((dl: { page_index: number }) => dl.page_index === pageIdx);
+      // Fields are now camelCase from Rust
+      const linesOnPage = displayLines.filter((dl: { pageIndex: number }) => dl.pageIndex === pageIdx);
 
       // Find the line by comparing y positions directly
       let clickedLine = null;
       for (const line of linesOnPage) {
-        const lineY = MARGIN_TOP + line.y_position;
+        const lineY = MARGIN_TOP + line.yPosition;
         if (y >= lineY && y < lineY + lineHeightPx) {
           clickedLine = line;
           break;
@@ -1476,7 +2189,7 @@
       if (!clickedLine && linesOnPage.length > 0) {
         let minDist = Infinity;
         for (const line of linesOnPage) {
-          const lineY = MARGIN_TOP + line.y_position;
+          const lineY = MARGIN_TOP + line.yPosition;
           const dist = Math.abs(y - lineY);
           if (dist < minDist) {
             minDist = dist;
@@ -1486,11 +2199,11 @@
       }
 
       if (clickedLine) {
-        const para = clickedLine.para_index;
+        const para = clickedLine.paraIndex;
         const text = engine.get_paragraph(para) || '';
-        const lineStartOffset = clickedLine.start_offset;
-        // x_position from engine includes column offset
-        const lineX = clickedLine.x_position || MARGIN_LEFT;
+        const lineStartOffset = clickedLine.startOffset;
+        // xPosition from engine includes column offset
+        const lineX = clickedLine.xPosition || MARGIN_LEFT;
 
         const ctx = canvas.getContext('2d');
         if (ctx) {
@@ -1502,7 +2215,7 @@
             return { para, offset: lineStartOffset };
           }
 
-          for (let i = lineStartOffset; i <= clickedLine.end_offset; i++) {
+          for (let i = lineStartOffset; i <= clickedLine.endOffset; i++) {
             const textFromLineStart = text.slice(lineStartOffset, i);
             const width = ctx.measureText(textFromLineStart).width;
             if (lineX + width > x) {
@@ -1514,7 +2227,7 @@
             }
             charPos = i;
           }
-          return { para, offset: Math.min(charPos, clickedLine.end_offset) };
+          return { para, offset: Math.min(charPos, clickedLine.endOffset) };
         }
       }
     } catch (e) {
@@ -1534,6 +2247,55 @@
     const zoomFactor = ZOOM / 100;
     const x = (event.clientX - rect.left) / zoomFactor;
     const y = (event.clientY - rect.top) / zoomFactor;
+
+    // Check if clicking on a resize handle for a selected image
+    if (selectedImageId && !isCropping) {
+      const bounds = getSelectedImageBounds();
+      if (bounds && bounds.pageIndex === pageIdx) {
+        const handle = getResizeHandleAtPoint(x, y, bounds);
+        if (handle) {
+          event.preventDefault();
+          startResize(handle, event.clientX, event.clientY);
+          return;
+        }
+        // Check if clicking inside the selected image (for dragging)
+        if (x >= bounds.x && x <= bounds.x + bounds.width && y >= bounds.y && y <= bounds.y + bounds.height) {
+          event.preventDefault();
+          startImageDrag(pageIdx, x, y, bounds.x, bounds.y);
+          return;
+        }
+      }
+    }
+
+    // Check if clicking on a crop handle
+    if (selectedImageId && isCropping) {
+      const bounds = getSelectedImageBounds();
+      if (bounds && bounds.pageIndex === pageIdx) {
+        const handle = getResizeHandleAtPoint(x, y, bounds);
+        if (handle) {
+          event.preventDefault();
+          startCropDrag(handle, event.clientX, event.clientY);
+          return;
+        }
+      }
+    }
+
+    // Check if clicking on an image
+    const imageAtPos = getImageAtPosition(pageIdx, x, y);
+    if (imageAtPos) {
+      // Select the image
+      selectImage(imageAtPos.id, pageIdx, x, y);
+      return;
+    }
+
+    // Clicking elsewhere - deselect image if selected
+    if (selectedImageId) {
+      deselectImage();
+      // Also end crop mode if active
+      if (isCropping) {
+        endCropMode();
+      }
+    }
 
     const pos = getCursorPositionFromMouse(pageIdx, x, y);
     if (!pos) return;
@@ -1566,7 +2328,7 @@
   }
 
   function handleCanvasMouseMove(event: MouseEvent, pageIdx: number) {
-    if (!isMouseDown || !engine) return;
+    if (!engine) return;
 
     const canvas = pageCanvases[pageIdx];
     if (!canvas) return;
@@ -1576,6 +2338,44 @@
     const zoomFactor = ZOOM / 100;
     const x = (event.clientX - rect.left) / zoomFactor;
     const y = (event.clientY - rect.top) / zoomFactor;
+
+    // Handle image resizing
+    if (isResizing) {
+      handleResizeMove(event.clientX, event.clientY);
+      return;
+    }
+
+    // Handle image cropping
+    if (isCropping && cropHandle) {
+      handleCropMove(event.clientX, event.clientY);
+      return;
+    }
+
+    // Handle image dragging
+    if (isDraggingImage) {
+      handleImageDrag(pageIdx, x, y);
+      return;
+    }
+
+    // Update cursor based on hover position when image is selected
+    if (selectedImageId) {
+      const bounds = getSelectedImageBounds();
+      if (bounds && bounds.pageIndex === pageIdx) {
+        const handle = getResizeHandleAtPoint(x, y, bounds);
+        if (handle) {
+          canvas.style.cursor = getResizeCursor(handle);
+        } else if (x >= bounds.x && x <= bounds.x + bounds.width && y >= bounds.y && y <= bounds.y + bounds.height) {
+          canvas.style.cursor = 'move';
+        } else {
+          canvas.style.cursor = 'text';
+        }
+      } else {
+        canvas.style.cursor = 'text';
+      }
+    }
+
+    // Handle text selection
+    if (!isMouseDown) return;
 
     const pos = getCursorPositionFromMouse(pageIdx, x, y);
     if (!pos) return;
@@ -1592,6 +2392,9 @@
 
   function handleCanvasMouseUp(event: MouseEvent) {
     isMouseDown = false;
+    endImageDrag();
+    endResize();
+    endCropDrag();
     hiddenTextarea?.focus();
   }
 </script>
@@ -1650,36 +2453,300 @@
       <div class="popup-dialog" onclick={(e) => e.stopPropagation()}>
         <div class="popup-header">
           <h3>Insert Image</h3>
-          <button class="popup-close" onclick={closeImageDialog}>×</button>
+          <button class="popup-close" onclick={closeImageDialog}>&times;</button>
         </div>
         <div class="popup-content">
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <!-- URL input -->
+          <div class="input-section">
+            <label for="image-url-wasm">Image URL</label>
+            <div class="url-input-row">
+              <input
+                id="image-url-wasm"
+                type="text"
+                bind:value={imageUrlInput}
+                placeholder="https://example.com/image.jpg"
+                onkeydown={(e) => e.key === 'Enter' && insertImageFromUrl()}
+              />
+              <button onclick={insertImageFromUrl}>Insert</button>
+            </div>
+          </div>
+
+          <div class="divider">
+            <span>or</span>
+          </div>
+
+          <!-- Drag and drop zone -->
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
           <div
             class="drop-zone"
             class:drag-over={dragOver}
             ondragover={(e) => { e.preventDefault(); dragOver = true; }}
             ondragleave={() => { dragOver = false; }}
             ondrop={handleImageDrop}
+            onclick={() => document.getElementById('file-input-wasm')?.click()}
           >
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="#9aa0a6">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
             <p>Drag and drop an image here</p>
-            <p>or</p>
-            <label class="file-input-label">
-              Choose File
-              <input type="file" accept="image/*" onchange={handleImageFileSelect} />
-            </label>
+            <p class="small">or click to select from your computer</p>
           </div>
-          <div class="url-input-section">
-            <label>Or enter image URL:</label>
-            <div class="url-input-row">
-              <input
-                type="text"
-                bind:value={imageUrlInput}
-                placeholder="https://example.com/image.jpg"
-              />
-              <button onclick={insertImageFromUrl}>Insert</button>
-            </div>
+          <input
+            id="file-input-wasm"
+            type="file"
+            accept="image/*"
+            class="file-input"
+            onchange={handleImageFileSelect}
+          />
+
+          <p class="tip">Tip: You can also paste an image directly in the editor (Ctrl+V)</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Image options popup -->
+  {#if showImageOptions && selectedImageId && !isCropping}
+    {@const selectedImage = getSelectedImageData()}
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="image-options-overlay" onclick={closeImageOptionsPopup}>
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <div
+        class="image-options-popup"
+        style="left: {imageOptionsPosition.x}px; top: {imageOptionsPosition.y}px;"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <div class="image-options-header">
+          <span>Layout Options</span>
+          <button class="popup-close" onclick={closeImageOptionsPopup}>&times;</button>
+        </div>
+
+        <!-- In Line with Text -->
+        <div class="image-options-section">
+          <div class="section-label">In Line with Text</div>
+          <div class="image-options-buttons">
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'inline'}
+              onclick={() => setImageWrapStyle('inline')}
+              title="In line with text"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <line x1="2" y1="8" x2="8" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="9" y="5" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="16" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="14" x2="22" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="18" x2="22" y2="18" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>In Line</span>
+            </button>
           </div>
         </div>
+
+        <!-- With Text Wrapping -->
+        <div class="image-options-section">
+          <div class="section-label">With Text Wrapping</div>
+          <div class="image-options-buttons wrap-buttons">
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'square'}
+              onclick={() => setImageWrapStyle('square')}
+              title="Square - text wraps in a square around the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="2" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="12" y1="5" x2="22" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="11" x2="22" y2="11" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="15" x2="22" y2="15" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="19" x2="22" y2="19" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Square</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'tight'}
+              onclick={() => setImageWrapStyle('tight')}
+              title="Tight - text wraps tightly around the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M3 5 L9 5 L9 11 L3 11 Z" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="11" y1="5" x2="21" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="11" y1="8" x2="21" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="11" y1="11" x2="21" y2="11" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="3" y1="14" x2="21" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="3" y1="18" x2="21" y2="18" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Tight</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'through'}
+              onclick={() => setImageWrapStyle('through')}
+              title="Through - text flows through the image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M4 4 L10 4 L10 10 L4 10 Z" stroke="currentColor" stroke-width="1.5" fill="none" stroke-dasharray="2,1"/>
+                <line x1="12" y1="5" x2="20" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="12" y1="9" x2="20" y2="9" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="4" y1="14" x2="20" y2="14" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="4" y1="18" x2="20" y2="18" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Through</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'top-bottom'}
+              onclick={() => setImageWrapStyle('top-bottom')}
+              title="Top and Bottom - text above and below only"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <line x1="2" y1="4" x2="22" y2="4" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="6" y="8" width="12" height="8" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                <line x1="2" y1="20" x2="22" y2="20" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Top/Bottom</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'behind'}
+              onclick={() => setImageWrapStyle('behind')}
+              title="Behind Text - image appears behind text"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.5"/>
+                <line x1="2" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="1.5"/>
+                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5"/>
+              </svg>
+              <span>Behind</span>
+            </button>
+            <button
+              class="layout-btn"
+              class:active={selectedImage?.wrapStyle === 'in-front'}
+              onclick={() => setImageWrapStyle('in-front')}
+              title="In Front of Text - image appears in front of text"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <line x1="2" y1="8" x2="22" y2="8" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <line x1="2" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <line x1="2" y1="16" x2="22" y2="16" stroke="currentColor" stroke-width="1.5" opacity="0.5"/>
+                <rect x="6" y="6" width="12" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="white"/>
+              </svg>
+              <span>In Front</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Horizontal Alignment (for non-inline modes) -->
+        {#if selectedImage?.wrapStyle !== 'inline'}
+          <div class="image-options-section">
+            <div class="section-label">Horizontal Position</div>
+            <div class="image-options-buttons">
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'left'}
+                onclick={() => setImageAlign('left')}
+                title="Align left"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="2" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'center'}
+                onclick={() => setImageAlign('center')}
+                title="Center"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="7" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+              <button
+                class="layout-btn small"
+                class:active={selectedImage?.horizontalAlign === 'right'}
+                onclick={() => setImageAlign('right')}
+                title="Align right"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="12" y="6" width="10" height="12" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        <!-- Position Mode -->
+        <div class="image-options-section">
+          <div class="section-label">Position</div>
+          <div class="position-radio-group">
+            <label class="radio-option">
+              <input
+                type="radio"
+                name="positionMode"
+                checked={selectedImage?.positionMode === 'move-with-text'}
+                onchange={() => setImagePositionMode('move-with-text')}
+              />
+              <span>Move with text</span>
+            </label>
+            <label class="radio-option">
+              <input
+                type="radio"
+                name="positionMode"
+                checked={selectedImage?.positionMode === 'fixed-position'}
+                onchange={() => setImagePositionMode('fixed-position')}
+              />
+              <span>Fix position on page</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Edit Section -->
+        <div class="image-options-section">
+          <div class="section-label">Edit</div>
+          <div class="image-options-buttons">
+            <button
+              class="layout-btn"
+              onclick={startCropMode}
+              title="Crop image"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z"/>
+              </svg>
+              <span>Crop</span>
+            </button>
+            <button
+              class="layout-btn"
+              onclick={resetCrop}
+              title="Reset crop"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+              </svg>
+              <span>Reset</span>
+            </button>
+          </div>
+        </div>
+
+        <button class="delete-image-btn" onclick={deleteSelectedImage}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+          </svg>
+          Delete Image
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Crop mode overlay -->
+  {#if isCropping && selectedImageId}
+    <div class="crop-mode-bar">
+      <span>Crop Mode - Drag handles to adjust crop area</span>
+      <div class="crop-mode-buttons">
+        <button class="crop-btn done" onclick={endCropMode}>Done</button>
+        <button class="crop-btn reset" onclick={resetCrop}>Reset</button>
+        <button class="crop-btn cancel" onclick={cancelCrop}>Cancel</button>
       </div>
     </div>
   {/if}
@@ -1804,12 +2871,49 @@
     padding: 20px;
   }
 
+  .input-section {
+    margin-bottom: 16px;
+  }
+
+  .input-section label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+    color: #5f6368;
+  }
+
+  .divider {
+    display: flex;
+    align-items: center;
+    margin: 20px 0;
+  }
+
+  .divider::before,
+  .divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #e0e0e0;
+  }
+
+  .divider span {
+    padding: 0 16px;
+    color: #5f6368;
+    font-size: 14px;
+  }
+
   .drop-zone {
     border: 2px dashed #dadce0;
     border-radius: 8px;
     padding: 40px 20px;
     text-align: center;
+    cursor: pointer;
     transition: all 0.2s;
+  }
+
+  .drop-zone:hover {
+    border-color: #1a73e8;
+    background: #f8f9ff;
   }
 
   .drop-zone.drag-over {
@@ -1818,39 +2922,27 @@
   }
 
   .drop-zone p {
-    margin: 8px 0;
+    margin: 8px 0 0;
     color: #5f6368;
   }
 
-  .file-input-label {
-    display: inline-block;
-    padding: 8px 16px;
-    background: #1a73e8;
-    color: white;
-    border-radius: 4px;
-    cursor: pointer;
-    margin-top: 8px;
+  .drop-zone p.small {
+    font-size: 12px;
+    color: #9aa0a6;
   }
 
-  .file-input-label:hover {
-    background: #1557b0;
-  }
-
-  .file-input-label input {
+  .file-input {
     display: none;
   }
 
-  .url-input-section {
-    margin-top: 20px;
-    padding-top: 20px;
-    border-top: 1px solid #e0e0e0;
-  }
-
-  .url-input-section label {
-    display: block;
-    margin-bottom: 8px;
+  .tip {
+    margin-top: 16px;
+    padding: 12px;
+    background: #f8f9fa;
+    border-radius: 4px;
+    font-size: 13px;
     color: #5f6368;
-    font-size: 14px;
+    text-align: center;
   }
 
   .url-input-row {
@@ -1883,5 +2975,220 @@
 
   .url-input-row button:hover {
     background: #1557b0;
+  }
+
+  /* Image options popup styles */
+  .image-options-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1000;
+  }
+
+  .image-options-popup {
+    position: fixed;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+    min-width: 200px;
+    transform: translate(-50%, 10px);
+    z-index: 1001;
+  }
+
+  .image-options-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid #e0e0e0;
+    font-size: 13px;
+    font-weight: 500;
+    color: #202124;
+  }
+
+  .popup-close {
+    background: none;
+    border: none;
+    font-size: 18px;
+    cursor: pointer;
+    color: #5f6368;
+    padding: 0;
+    line-height: 1;
+  }
+
+  .popup-close:hover {
+    color: #202124;
+  }
+
+  .image-options-section {
+    padding: 8px;
+    border-bottom: 1px solid #e0e0e0;
+  }
+
+  .image-options-section:last-of-type {
+    border-bottom: none;
+  }
+
+  .section-label {
+    font-size: 11px;
+    color: #5f6368;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    padding-left: 4px;
+  }
+
+  .image-options-buttons {
+    display: flex;
+    padding: 0;
+    gap: 4px;
+  }
+
+  .wrap-buttons {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+  }
+
+  .layout-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 12px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    cursor: pointer;
+    color: #5f6368;
+    font-size: 11px;
+    transition: all 0.15s;
+  }
+
+  .layout-btn:hover {
+    background: #f1f3f4;
+  }
+
+  .layout-btn.active {
+    background: #e8f0fe;
+    border-color: #1a73e8;
+    color: #1a73e8;
+  }
+
+  .layout-btn svg {
+    width: 28px;
+    height: 28px;
+  }
+
+  .layout-btn.small {
+    padding: 6px 10px;
+  }
+
+  .layout-btn.small svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .position-radio-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 8px;
+  }
+
+  .radio-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #202124;
+  }
+
+  .radio-option input[type="radio"] {
+    margin: 0;
+    cursor: pointer;
+  }
+
+  .delete-image-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: calc(100% - 16px);
+    margin: 0 8px 8px;
+    padding: 8px 12px;
+    border: none;
+    border-radius: 4px;
+    background: none;
+    color: #d93025;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .delete-image-btn:hover {
+    background: #fce8e6;
+  }
+
+  /* Crop mode bar */
+  .crop-mode-bar {
+    position: fixed;
+    top: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #ff9800;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    z-index: 1001;
+    font-size: 14px;
+  }
+
+  .crop-mode-buttons {
+    display: flex;
+    gap: 8px;
+  }
+
+  .crop-btn {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    font-weight: 500;
+    transition: background 0.15s;
+  }
+
+  .crop-btn.done {
+    background: white;
+    color: #ff9800;
+  }
+
+  .crop-btn.done:hover {
+    background: #fff3e0;
+  }
+
+  .crop-btn.reset {
+    background: rgba(255, 255, 255, 0.2);
+    color: white;
+  }
+
+  .crop-btn.reset:hover {
+    background: rgba(255, 255, 255, 0.3);
+  }
+
+  .crop-btn.cancel {
+    background: transparent;
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.5);
+  }
+
+  .crop-btn.cancel:hover {
+    background: rgba(255, 255, 255, 0.1);
   }
 </style>

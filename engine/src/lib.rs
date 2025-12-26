@@ -594,6 +594,62 @@ impl Engine {
         }
         self.dirty = true;
     }
+
+    /// Set image wrap style
+    #[wasm_bindgen]
+    pub fn set_image_wrap_style(&mut self, id: &str, wrap_style: &str) {
+        if let Some(image) = self.document.images.iter_mut().find(|img| img.id == id) {
+            image.wrap_style = match wrap_style {
+                "inline" => ImageWrapStyle::Inline,
+                "top-bottom" => ImageWrapStyle::TopBottom,
+                "square" => ImageWrapStyle::Square,
+                "tight" => ImageWrapStyle::Tight,
+                "through" => ImageWrapStyle::Through,
+                "behind" => ImageWrapStyle::Behind,
+                "in-front" => ImageWrapStyle::InFront,
+                _ => ImageWrapStyle::Inline,
+            };
+            self.dirty = true;
+        }
+    }
+
+    /// Set image to fixed position (for dragging)
+    #[wasm_bindgen]
+    pub fn set_image_position(&mut self, id: &str, x: f64, y: f64, page_index: usize) {
+        if let Some(image) = self.document.images.iter_mut().find(|img| img.id == id) {
+            image.x = Some(x);
+            image.y = Some(y);
+            image.page_index = Some(page_index);
+            image.position_mode = ImagePositionMode::FixedPosition;
+            self.dirty = true;
+        }
+    }
+
+    /// Clear image position (reset to move-with-text mode)
+    #[wasm_bindgen]
+    pub fn clear_image_position(&mut self, id: &str) {
+        if let Some(image) = self.document.images.iter_mut().find(|img| img.id == id) {
+            image.x = None;
+            image.y = None;
+            image.page_index = None;
+            image.position_mode = ImagePositionMode::MoveWithText;
+            self.dirty = true;
+        }
+    }
+
+    /// Set image horizontal alignment
+    #[wasm_bindgen]
+    pub fn set_image_horizontal_align(&mut self, id: &str, align: &str) {
+        if let Some(image) = self.document.images.iter_mut().find(|img| img.id == id) {
+            image.horizontal_align = match align {
+                "left" => HorizontalAlign::Left,
+                "center" => HorizontalAlign::Center,
+                "right" => HorizontalAlign::Right,
+                _ => HorizontalAlign::Left,
+            };
+            self.dirty = true;
+        }
+    }
 }
 
 impl Default for Engine {
