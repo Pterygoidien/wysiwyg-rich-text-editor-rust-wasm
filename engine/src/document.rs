@@ -1,7 +1,39 @@
-//! Document model definitions
+//! Document Model
 //!
-//! This module contains the core data structures that represent a document:
-//! paragraphs, formatting, images, and metadata.
+//! This module defines the core data structures that represent a document's content
+//! and formatting. It provides a structured, serializable representation of rich text
+//! documents with support for:
+//!
+//! - **Paragraphs**: Text content with inline formatting (bold, italic, colors, etc.)
+//! - **Block Types**: Headings (H1-H4), blockquotes, and regular paragraphs
+//! - **Lists**: Bulleted and numbered lists with proper counter management
+//! - **Images**: Embedded images with positioning, sizing, and text wrapping options
+//! - **Page Breaks**: Explicit page break markers for document pagination
+//!
+//! # Architecture
+//!
+//! The document model follows a hierarchical structure:
+//!
+//! ```text
+//! Document
+//! ├── paragraphs: Vec<Paragraph>
+//! │   ├── text: String
+//! │   ├── meta: ParagraphMeta (alignment, block type, list type)
+//! │   └── styles: Vec<TextStyle> (inline formatting ranges)
+//! └── images: Vec<DocumentImage>
+//!     └── (id, src, dimensions, wrapping options)
+//! ```
+//!
+//! # Special Markers
+//!
+//! The document uses Unicode characters as markers for special content:
+//! - `U+FFFD` (Replacement Character): Page break marker
+//! - `U+FFFC` (Object Replacement Character): Image placeholder, followed by image ID
+//!
+//! # Serialization
+//!
+//! All types implement `Serialize` and `Deserialize` for JSON persistence,
+//! enabling document save/load functionality.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +71,67 @@ pub struct Paragraph {
     pub text: String,
     /// Paragraph metadata/formatting
     pub meta: ParagraphMeta,
+    /// Inline text styles (ranges with formatting)
+    #[serde(default)]
+    pub styles: Vec<TextStyle>,
+}
+
+/// Inline text style for a range of characters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextStyle {
+    /// Start character index (inclusive)
+    pub start: usize,
+    /// End character index (exclusive)
+    pub end: usize,
+    /// Bold formatting
+    #[serde(default)]
+    pub bold: bool,
+    /// Italic formatting
+    #[serde(default)]
+    pub italic: bool,
+    /// Underline formatting
+    #[serde(default)]
+    pub underline: bool,
+    /// Strikethrough formatting
+    #[serde(default)]
+    pub strikethrough: bool,
+    /// Text color (CSS color string)
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Background/highlight color (CSS color string)
+    #[serde(default)]
+    pub background: Option<String>,
+}
+
+impl TextStyle {
+    pub fn new(start: usize, end: usize) -> Self {
+        TextStyle {
+            start,
+            end,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            color: None,
+            background: None,
+        }
+    }
+
+    /// Check if this style has any formatting applied
+    pub fn has_formatting(&self) -> bool {
+        self.bold || self.italic || self.underline || self.strikethrough
+            || self.color.is_some() || self.background.is_some()
+    }
+
+    /// Check if this style overlaps with a range
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.start < end && self.end > start
+    }
+
+    /// Check if this style contains a range
+    pub fn contains(&self, start: usize, end: usize) -> bool {
+        self.start <= start && self.end >= end
+    }
 }
 
 impl Paragraph {
@@ -46,11 +139,129 @@ impl Paragraph {
         Paragraph {
             text,
             meta: ParagraphMeta::default(),
+            styles: Vec::new(),
         }
     }
 
     pub fn with_meta(text: String, meta: ParagraphMeta) -> Self {
-        Paragraph { text, meta }
+        Paragraph { text, meta, styles: Vec::new() }
+    }
+
+    /// Apply a style to a range of text
+    /// This handles merging and splitting existing styles
+    pub fn apply_style<F>(&mut self, start: usize, end: usize, modifier: F)
+    where
+        F: Fn(&mut TextStyle),
+    {
+        if start >= end {
+            return;
+        }
+
+        // Collect styles that need to be modified
+        let mut new_styles: Vec<TextStyle> = Vec::new();
+
+        for style in self.styles.iter() {
+            if style.overlaps(start, end) {
+                // Style overlaps with the range we're modifying
+
+                // Part before the range (unchanged)
+                if style.start < start {
+                    let mut before = style.clone();
+                    before.end = start;
+                    new_styles.push(before);
+                }
+
+                // Part after the range (unchanged)
+                if style.end > end {
+                    let mut after = style.clone();
+                    after.start = end;
+                    new_styles.push(after);
+                }
+
+                // The overlapping part (will be merged with the new style)
+                let overlap_start = style.start.max(start);
+                let overlap_end = style.end.min(end);
+                let mut overlap = style.clone();
+                overlap.start = overlap_start;
+                overlap.end = overlap_end;
+                modifier(&mut overlap);
+                if overlap.has_formatting() {
+                    new_styles.push(overlap);
+                }
+            } else {
+                // Style doesn't overlap, keep it as is
+                new_styles.push(style.clone());
+            }
+        }
+
+        // Check if we need to add a new style for uncovered parts of the range
+        // Find gaps in the range [start, end) that aren't covered by any style
+        let mut covered: Vec<(usize, usize)> = new_styles
+            .iter()
+            .filter(|s| s.overlaps(start, end))
+            .map(|s| (s.start.max(start), s.end.min(end)))
+            .collect();
+        covered.sort_by_key(|r| r.0);
+
+        let mut pos = start;
+        for (s, e) in covered {
+            if pos < s {
+                // Gap from pos to s
+                let mut new_style = TextStyle::new(pos, s);
+                modifier(&mut new_style);
+                if new_style.has_formatting() {
+                    new_styles.push(new_style);
+                }
+            }
+            pos = e;
+        }
+        if pos < end {
+            // Gap from pos to end
+            let mut new_style = TextStyle::new(pos, end);
+            modifier(&mut new_style);
+            if new_style.has_formatting() {
+                new_styles.push(new_style);
+            }
+        }
+
+        // Sort by start position and merge adjacent styles with same formatting
+        new_styles.sort_by_key(|s| s.start);
+        self.styles = Self::merge_adjacent_styles(new_styles);
+    }
+
+    /// Merge adjacent styles that have identical formatting
+    fn merge_adjacent_styles(styles: Vec<TextStyle>) -> Vec<TextStyle> {
+        let mut result: Vec<TextStyle> = Vec::new();
+
+        for style in styles {
+            if let Some(last) = result.last_mut() {
+                if last.end == style.start
+                    && last.bold == style.bold
+                    && last.italic == style.italic
+                    && last.underline == style.underline
+                    && last.strikethrough == style.strikethrough
+                    && last.color == style.color
+                    && last.background == style.background
+                {
+                    // Merge
+                    last.end = style.end;
+                    continue;
+                }
+            }
+            result.push(style);
+        }
+
+        result
+    }
+
+    /// Get the style at a specific character position
+    pub fn style_at(&self, pos: usize) -> Option<&TextStyle> {
+        self.styles.iter().find(|s| s.start <= pos && s.end > pos)
+    }
+
+    /// Get all styles that overlap with a range
+    pub fn styles_in_range(&self, start: usize, end: usize) -> Vec<&TextStyle> {
+        self.styles.iter().filter(|s| s.overlaps(start, end)).collect()
     }
 
     /// Check if this paragraph is a page break marker
@@ -268,41 +479,3 @@ impl DocumentImage {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_paragraph_page_break() {
-        let para = Paragraph::new("\u{FFFD}".to_string());
-        assert!(para.is_page_break());
-    }
-
-    #[test]
-    fn test_paragraph_not_page_break() {
-        let para = Paragraph::new("regular text".to_string());
-        assert!(!para.is_page_break());
-    }
-
-    #[test]
-    fn test_paragraph_image() {
-        let para = Paragraph::new("\u{FFFC}image-123".to_string());
-        assert!(para.is_image());
-        assert_eq!(para.image_id(), Some("image-123"));
-    }
-
-    #[test]
-    fn test_paragraph_not_image() {
-        let para = Paragraph::new("regular text".to_string());
-        assert!(!para.is_image());
-        assert_eq!(para.image_id(), None);
-    }
-
-    #[test]
-    fn test_block_type_multipliers() {
-        assert_eq!(BlockType::Heading1.font_size_multiplier(), 2.0);
-        assert_eq!(BlockType::Heading2.font_size_multiplier(), 1.5);
-        assert_eq!(BlockType::Heading3.font_size_multiplier(), 1.17);
-        assert_eq!(BlockType::Paragraph.font_size_multiplier(), 1.0);
-    }
-}

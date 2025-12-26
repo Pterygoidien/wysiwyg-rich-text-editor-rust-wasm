@@ -4,7 +4,7 @@
   import Sidebar from './lib/Sidebar.svelte';
 
   let editorRef: ReturnType<typeof Editor>;
-  let useWasm = $state(false);
+  let useWasm = $state(true);
 
   function handleNavigate(paraIndex: number) {
     editorRef?.navigateToParagraph(paraIndex);

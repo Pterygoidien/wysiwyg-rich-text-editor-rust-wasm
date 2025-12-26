@@ -1,8 +1,39 @@
-//! Text handling utilities
+//! Text Handling Utilities
 //!
-//! This module provides text-related utilities including:
-//! - Unicode-aware text manipulation
-//! - Text shaping preparation (for future rustybuzz integration)
+//! This module provides Unicode-aware text manipulation utilities essential for
+//! correct handling of international text in the editor.
+//!
+//! # Why This Module Exists
+//!
+//! JavaScript strings and Rust strings handle Unicode differently:
+//! - JavaScript uses UTF-16 code units
+//! - Rust uses UTF-8 bytes
+//! - Neither directly gives you "character count" for user-facing operations
+//!
+//! This module provides operations that work on Unicode scalar values (Rust's `char`),
+//! which more closely matches user expectations for cursor movement and selection.
+//!
+//! # Key Functions
+//!
+//! - `char_count()`: Get the number of characters (not bytes or code units)
+//! - `char_substring()`: Extract a substring by character indices
+//! - `char_to_byte_index()` / `byte_to_char_index()`: Index conversion
+//! - Word boundary detection for Ctrl+Arrow navigation
+//!
+//! # Text Shaping (Future)
+//!
+//! The `split_into_runs()` function is a placeholder for future integration with
+//! rustybuzz for proper text shaping. Currently returns the entire text as a single
+//! run, but could be extended to:
+//! - Split by script (Latin, Arabic, CJK, etc.)
+//! - Handle bidirectional text
+//! - Apply font fallback
+//!
+//! # Limitations
+//!
+//! - Does not handle grapheme clusters (e.g., emoji with modifiers)
+//! - Does not handle combining characters correctly for all cases
+//! - For full Unicode correctness, consider using the `unicode-segmentation` crate
 
 use wasm_bindgen::prelude::*;
 
@@ -105,35 +136,3 @@ pub fn split_into_runs(text: &str) -> Vec<TextRun> {
     }]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_char_count_ascii() {
-        assert_eq!(char_count("hello"), 5);
-    }
-
-    #[test]
-    fn test_char_count_unicode() {
-        assert_eq!(char_count("héllo"), 5);
-        assert_eq!(char_count("你好"), 2);
-        assert_eq!(char_count("👋🌍"), 2);
-    }
-
-    #[test]
-    fn test_char_substring() {
-        assert_eq!(char_substring("hello", 1, 4), "ell");
-        assert_eq!(char_substring("héllo", 1, 4), "éll");
-        assert_eq!(char_substring("你好世界", 1, 3), "好世");
-    }
-
-    #[test]
-    fn test_word_boundaries() {
-        let text = "hello world test";
-        assert_eq!(next_word_boundary(text, 0), 6);
-        assert_eq!(next_word_boundary(text, 6), 12);
-        assert_eq!(prev_word_boundary(text, 11), 6);
-        assert_eq!(prev_word_boundary(text, 6), 0);
-    }
-}

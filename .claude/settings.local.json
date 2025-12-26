@@ -19,7 +19,12 @@
       "Bash(cmd /c \"pushd c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine && cargo test 2>&1\")",
       "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine''; cargo test 2>&1 | Out-String\")",
       "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated''; npm run build:wasm 2>&1 | Out-String\")",
-      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated''; npm run build 2>&1 | Out-String\")"
+      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated''; npm run build 2>&1 | Out-String\")",
+      "Bash(dir /s /b \"c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine\\\\src\")",
+      "Bash(powershell.exe -Command \"npm run build:wasm 2>&1 | Out-String\")",
+      "Bash(powershell.exe -Command \"npm run build 2>&1 | Out-String\")",
+      "Bash(wasm-pack build:*)",
+      "Bash(dir:*)"
     ]
   }
 }

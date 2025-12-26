@@ -101,6 +101,20 @@ export interface DrawLineCommand {
   width: number;
 }
 
+export interface DrawUnderlineCommand {
+  type: 'drawUnderline';
+  x: number;
+  y: number;
+  width: number;
+}
+
+export interface DrawStrikethroughCommand {
+  type: 'drawStrikethrough';
+  x: number;
+  y: number;
+  width: number;
+}
+
 // Position mapping result types
 export interface DisplayPosition {
   line: number;
@@ -113,6 +127,17 @@ export interface DisplayPosition {
 export interface ParagraphPosition {
   para: number;
   offset: number;
+}
+
+// Paragraph metadata types
+export type TextAlign = 'left' | 'center' | 'right' | 'justify';
+export type BlockType = 'p' | 'h1' | 'h2' | 'h3' | 'h4' | 'blockquote';
+export type ListType = 'none' | 'bullet' | 'numbered';
+
+export interface ParagraphMeta {
+  align: TextAlign;
+  blockType: BlockType;
+  listType: ListType;
 }
 
 // Engine type (will be filled when WASM loads)
@@ -153,6 +178,36 @@ export interface Engine {
   // Document I/O
   load_document(json: string): void;
   save_document(): string;
+
+  // Paragraph metadata functions
+  get_paragraph_meta(index: number): string | null;
+  set_block_type(index: number, blockType: string): void;
+  set_alignment(index: number, align: string): void;
+  set_list_type(index: number, listType: string): void;
+  toggle_list(index: number, listType: string): void;
+
+  // Text styling functions
+  toggle_bold(paraIndex: number, start: number, end: number): void;
+  toggle_italic(paraIndex: number, start: number, end: number): void;
+  toggle_underline(paraIndex: number, start: number, end: number): void;
+  toggle_strikethrough(paraIndex: number, start: number, end: number): void;
+  set_text_color(paraIndex: number, start: number, end: number, color: string): void;
+  set_highlight_color(paraIndex: number, start: number, end: number, color: string): void;
+  get_paragraph_styles(index: number): string;
+
+  // Image functions
+  add_image(id: string, src: string, width: number, height: number, naturalWidth: number, naturalHeight: number): void;
+  insert_image_paragraph(index: number, imageId: string): void;
+  get_image(id: string): string | null;
+  update_image_size(id: string, width: number, height: number): void;
+  delete_image(id: string): void;
+
+  // Page break functions
+  insert_page_break(index: number): void;
+
+  // List functions
+  get_list_type(index: number): string;
+  insert_paragraph_with_list(index: number, text: string, sourcePara: number): void;
 }
 
 /**
@@ -174,6 +229,18 @@ export function parseParagraphPosition(json: string | null): ParagraphPosition |
   if (!json) return null;
   try {
     return JSON.parse(json) as ParagraphPosition;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse paragraph metadata result from engine
+ */
+export function parseParagraphMeta(json: string | null): ParagraphMeta | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as ParagraphMeta;
   } catch {
     return null;
   }
@@ -243,6 +310,7 @@ export function createMeasureFunction(
 
 /**
  * Execute render commands on a canvas context
+ * Tracks text position for proper rendering of styled segments
  */
 export function executeRenderCommands(
   ctx: CanvasRenderingContext2D,
@@ -250,7 +318,13 @@ export function executeRenderCommands(
   loadedImages: Map<string, HTMLImageElement>,
   fontFamily: string
 ): void {
-  for (const cmd of commands) {
+  // Track current X position for styled text segments
+  let currentTextX = 0;
+  let lastTextY = 0;
+  let lastTextWidth = 0;
+
+  for (let i = 0; i < commands.length; i++) {
+    const cmd = commands[i];
     switch (cmd.type) {
       case 'setFont': {
         const c = cmd as unknown as SetFontCommand;
@@ -275,25 +349,37 @@ export function executeRenderCommands(
       case 'drawText': {
         const c = cmd as unknown as DrawTextCommand;
         ctx.fillText(c.text, c.x, c.y);
+        // Track position for underline/strikethrough
+        currentTextX = c.x;
+        lastTextY = c.y;
+        lastTextWidth = ctx.measureText(c.text).width;
         break;
       }
 
       case 'drawTextJustified': {
         const c = cmd as unknown as DrawTextJustifiedCommand;
         let x = c.x;
-        for (let i = 0; i < c.words.length; i++) {
-          ctx.fillText(c.words[i], x, c.y);
-          x += ctx.measureText(c.words[i]).width;
-          if (i < c.words.length - 1) {
+        for (let j = 0; j < c.words.length; j++) {
+          ctx.fillText(c.words[j], x, c.y);
+          x += ctx.measureText(c.words[j]).width;
+          if (j < c.words.length - 1) {
             x += ctx.measureText(' ').width + c.wordSpacing;
           }
         }
+        // Track position
+        currentTextX = c.x;
+        lastTextY = c.y;
+        lastTextWidth = x - c.x;
         break;
       }
 
       case 'fillRect': {
         const c = cmd as unknown as FillRectCommand;
-        ctx.fillRect(c.x, c.y, c.width, c.height);
+        // If width is 0, use the measured text width (for highlights)
+        const width = c.width > 0 ? c.width : lastTextWidth;
+        if (width > 0) {
+          ctx.fillRect(c.x, c.y, width, c.height);
+        }
         break;
       }
 
@@ -310,6 +396,34 @@ export function executeRenderCommands(
         ctx.moveTo(c.x1, c.y1);
         ctx.lineTo(c.x2, c.y2);
         ctx.stroke();
+        break;
+      }
+
+      case 'drawUnderline': {
+        const c = cmd as unknown as DrawUnderlineCommand;
+        // Use measured text width if width is 0
+        const width = c.width > 0 ? c.width : lastTextWidth;
+        if (width > 0) {
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(currentTextX, c.y);
+          ctx.lineTo(currentTextX + width, c.y);
+          ctx.stroke();
+        }
+        break;
+      }
+
+      case 'drawStrikethrough': {
+        const c = cmd as unknown as DrawStrikethroughCommand;
+        // Use measured text width if width is 0
+        const width = c.width > 0 ? c.width : lastTextWidth;
+        if (width > 0) {
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(currentTextX, c.y);
+          ctx.lineTo(currentTextX + width, c.y);
+          ctx.stroke();
+        }
         break;
       }
 

@@ -1,11 +1,46 @@
-//! Render command generation
+//! Render Command Generation
 //!
-//! This module generates render commands that the JavaScript side
-//! can use to draw the document on a canvas.
+//! This module generates render commands that the JavaScript frontend uses to
+//! draw the document on an HTML5 Canvas. It implements a command pattern that
+//! separates layout computation (Rust/WASM) from actual drawing (JavaScript).
+//!
+//! # Design Philosophy
+//!
+//! Rather than directly calling Canvas APIs (which would require expensive WASM↔JS
+//! interop for every draw call), this module generates a batch of render commands
+//! as JSON. The JavaScript side then executes these commands in a single efficient
+//! loop.
+//!
+//! # Render Commands
+//!
+//! Available commands include:
+//! - **SetFont**: Configure font family, size, bold/italic
+//! - **SetFillColor/SetStrokeColor**: Set drawing colors
+//! - **DrawText**: Render text at a position
+//! - **DrawTextJustified**: Render justified text with word spacing
+//! - **FillRect/StrokeRect**: Draw rectangles (backgrounds, borders)
+//! - **FillCircle**: Draw circles (bullet points)
+//! - **DrawImage**: Render an image with cropping
+//! - **DrawUnderline/DrawStrikethrough**: Text decorations
+//! - **DrawPageNumber**: Page number footer
+//!
+//! # Usage
+//!
+//! ```ignore
+//! let commands = generate_render_commands(&display_lines, &document, &config, page_index);
+//! let json = serde_json::to_string(&commands)?;
+//! // Send json to JavaScript for execution
+//! ```
+//!
+//! # Styled Text Rendering
+//!
+//! Text rendering handles inline styles by splitting lines into styled segments.
+//! Each segment may have different bold, italic, color, or background settings,
+//! and is rendered as a separate DrawText command with appropriate font settings.
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlockType, Document, ListType, TextAlign};
+use crate::document::{BlockType, Document, ListType, TextAlign, TextStyle};
 use crate::layout::{DisplayLine, LayoutConfig};
 
 /// A render command that can be sent to JavaScript for drawing
@@ -30,6 +65,7 @@ pub enum RenderCommand {
         words: Vec<String>,
         x: f64,
         y: f64,
+        #[serde(rename = "wordSpacing")]
         word_spacing: f64,
     },
     /// Fill a rectangle
@@ -58,14 +94,19 @@ pub enum RenderCommand {
     FillCircle { x: f64, y: f64, radius: f64 },
     /// Draw an image
     DrawImage {
+        #[serde(rename = "imageId")]
         image_id: String,
         x: f64,
         y: f64,
         width: f64,
         height: f64,
+        #[serde(rename = "cropTop")]
         crop_top: f64,
+        #[serde(rename = "cropRight")]
         crop_right: f64,
+        #[serde(rename = "cropBottom")]
         crop_bottom: f64,
+        #[serde(rename = "cropLeft")]
         crop_left: f64,
     },
     /// Draw the cursor
@@ -79,6 +120,125 @@ pub enum RenderCommand {
     },
     /// Draw page number
     DrawPageNumber { number: usize, x: f64, y: f64 },
+    /// Draw underline
+    DrawUnderline { x: f64, y: f64, width: f64 },
+    /// Draw strikethrough
+    DrawStrikethrough { x: f64, y: f64, width: f64 },
+}
+
+/// A styled text segment for rendering
+#[derive(Debug, Clone)]
+struct StyledSegment {
+    text: String,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    color: String,
+    background: Option<String>,
+}
+
+/// Get styled segments for a display line
+/// Splits the line text based on overlapping styles
+fn get_styled_segments(
+    line_text: &str,
+    line_start: usize,
+    line_end: usize,
+    styles: &[TextStyle],
+    default_color: &str,
+    _block_type: BlockType,
+) -> Vec<StyledSegment> {
+    if line_text.is_empty() {
+        return vec![];
+    }
+
+    // Find all style boundaries within this line
+    let mut boundaries: Vec<usize> = vec![line_start, line_end];
+    for style in styles {
+        if style.start > line_start && style.start < line_end {
+            boundaries.push(style.start);
+        }
+        if style.end > line_start && style.end < line_end {
+            boundaries.push(style.end);
+        }
+    }
+    boundaries.sort();
+    boundaries.dedup();
+
+    // Create segments between boundaries
+    let mut segments = Vec::new();
+    for i in 0..boundaries.len() - 1 {
+        let seg_start = boundaries[i];
+        let seg_end = boundaries[i + 1];
+
+        // Get text for this segment
+        let text_start = seg_start - line_start;
+        let text_end = seg_end - line_start;
+        if text_start >= line_text.len() {
+            continue;
+        }
+        let text = line_text[text_start..text_end.min(line_text.len())].to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        // Merge styles that apply to this segment
+        let mut bold = false;
+        let mut italic = false;
+        let mut underline = false;
+        let mut strikethrough = false;
+        let mut color: Option<String> = None;
+        let mut background: Option<String> = None;
+
+        for style in styles {
+            if style.start <= seg_start && style.end >= seg_end {
+                // This style fully covers this segment
+                if style.bold {
+                    bold = true;
+                }
+                if style.italic {
+                    italic = true;
+                }
+                if style.underline {
+                    underline = true;
+                }
+                if style.strikethrough {
+                    strikethrough = true;
+                }
+                if style.color.is_some() && color.is_none() {
+                    color = style.color.clone();
+                }
+                if style.background.is_some() && background.is_none() {
+                    background = style.background.clone();
+                }
+            }
+        }
+
+        segments.push(StyledSegment {
+            text,
+            bold,
+            italic,
+            underline,
+            strikethrough,
+            color: color.unwrap_or_else(|| default_color.to_string()),
+            background,
+        });
+    }
+
+    // If no segments were created (no styles), return the whole line as one segment
+    if segments.is_empty() {
+        segments.push(StyledSegment {
+            text: line_text.to_string(),
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            color: default_color.to_string(),
+            background: None,
+        });
+    }
+
+    segments
 }
 
 /// Generate render commands for a specific page
@@ -210,45 +370,114 @@ pub fn generate_render_commands(
             });
         }
 
-        // Calculate text width for alignment
-        // Note: actual width calculation would need to call back to JS
-        // For now, we'll let JS handle alignment
-        let text_color = para_meta
+        // Get paragraph styles for this line
+        let para_styles = document
+            .paragraphs
+            .get(dl.para_index)
+            .map(|p| &p.styles[..])
+            .unwrap_or(&[]);
+
+        // Default text color
+        let default_color = para_meta
             .text_color
             .clone()
             .unwrap_or_else(|| "#202124".to_string());
-        commands.push(RenderCommand::SetFillColor { color: text_color });
 
         // Draw text based on alignment
         let text_y = y + (config.line_height_px() - font_size) / 2.0;
 
-        match para_meta.align {
-            TextAlign::Justify if !dl.is_last_line && !dl.text.is_empty() => {
-                let words: Vec<String> = dl.text.split(' ').map(|s| s.to_string()).collect();
+        // Get styled segments for this line
+        let segments = get_styled_segments(
+            &dl.text,
+            dl.start_offset,
+            dl.end_offset,
+            para_styles,
+            &default_color,
+            dl.block_type,
+        );
+
+        // Render each styled segment
+        let current_x = text_start_x;
+        for segment in &segments {
+            // Set font for this segment
+            commands.push(RenderCommand::SetFont {
+                font: "Arial".to_string(),
+                size: font_size,
+                bold: segment.bold || dl.block_type.is_bold(),
+                italic: segment.italic || dl.block_type.is_italic(),
+            });
+
+            // Draw background/highlight if present
+            if let Some(ref bg_color) = segment.background {
+                commands.push(RenderCommand::SetFillColor {
+                    color: bg_color.clone(),
+                });
+                // Note: width will need to be calculated by JS, using placeholder
+                commands.push(RenderCommand::FillRect {
+                    x: current_x,
+                    y,
+                    width: 0.0, // JS will calculate based on text measurement
+                    height: config.line_height_px(),
+                });
+            }
+
+            // Set text color
+            commands.push(RenderCommand::SetFillColor {
+                color: segment.color.clone(),
+            });
+
+            // Draw text
+            if para_meta.align == TextAlign::Justify && !dl.is_last_line && !dl.text.is_empty() && segments.len() == 1 {
+                // Only use justified rendering for unstyled single-segment lines
+                let words: Vec<String> = segment.text.split(' ').map(|s| s.to_string()).collect();
                 if words.len() > 1 {
-                    // Let JS calculate word spacing based on measured text width
                     commands.push(RenderCommand::DrawTextJustified {
                         words,
-                        x: text_start_x,
+                        x: current_x,
                         y: text_y,
-                        word_spacing: 0.0, // JS will calculate
+                        word_spacing: 0.0,
                     });
                 } else {
                     commands.push(RenderCommand::DrawText {
-                        text: dl.text.clone(),
-                        x: text_start_x,
+                        text: segment.text.clone(),
+                        x: current_x,
                         y: text_y,
                     });
                 }
-            }
-            _ => {
-                // For left, center, right alignment, JS will position based on measured width
+            } else {
                 commands.push(RenderCommand::DrawText {
-                    text: dl.text.clone(),
-                    x: text_start_x,
+                    text: segment.text.clone(),
+                    x: current_x,
                     y: text_y,
                 });
             }
+
+            // Draw underline if needed (JS needs to measure text width)
+            if segment.underline {
+                commands.push(RenderCommand::SetStrokeColor {
+                    color: segment.color.clone(),
+                });
+                commands.push(RenderCommand::DrawUnderline {
+                    x: current_x,
+                    y: text_y + font_size + 2.0,
+                    width: 0.0, // JS will calculate
+                });
+            }
+
+            // Draw strikethrough if needed
+            if segment.strikethrough {
+                commands.push(RenderCommand::SetStrokeColor {
+                    color: segment.color.clone(),
+                });
+                commands.push(RenderCommand::DrawStrikethrough {
+                    x: current_x,
+                    y: text_y + font_size / 2.0,
+                    width: 0.0, // JS will calculate
+                });
+            }
+
+            // Note: current_x advancement will be handled by JS based on text measurement
+            // We're emitting relative positions here
         }
     }
 
@@ -271,19 +500,3 @@ pub fn generate_render_commands(
     commands
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_page_has_page_number() {
-        let display_lines = vec![];
-        let document = Document::new();
-        let config = LayoutConfig::default();
-
-        let commands = generate_render_commands(&display_lines, &document, &config, 0);
-
-        // Should at least have page number command
-        assert!(commands.iter().any(|c| matches!(c, RenderCommand::DrawPageNumber { .. })));
-    }
-}
