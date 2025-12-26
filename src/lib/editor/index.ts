@@ -72,3 +72,6 @@ export * from './image-manager';
 
 // Canvas rendering utilities
 export * from './canvas-renderer';
+
+// Undo/Redo history management
+export * from './history-manager';

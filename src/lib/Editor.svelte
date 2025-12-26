@@ -14,9 +14,13 @@
     type DisplayLine,
     type FloatImage,
     type ResizeHandle,
+    type EditorSnapshot,
+    type HistoryManager,
     IMAGE_MARKER,
     PAGE_BREAK_MARKER,
-    createDefaultMeta
+    createDefaultMeta,
+    createHistoryManager,
+    createDebouncedPush
   } from './editor';
 
   let editorContainer: HTMLDivElement;
@@ -37,6 +41,78 @@
   let cursorOffset = $state(0); // offset within the paragraph
   let selectionStart: { para: number; offset: number } | null = $state(null);
   let selectionEnd: { para: number; offset: number } | null = $state(null);
+
+  // Undo/Redo history
+  const historyManager = createHistoryManager(100);
+  const { schedulePush: scheduleHistoryPush, cancelPush: cancelHistoryPush, flushPush: flushHistoryPush } = createDebouncedPush(historyManager, 500);
+  let canUndo = $state(false);
+  let canRedo = $state(false);
+
+  /** Creates a snapshot of the current editor state for history */
+  function getEditorSnapshot(): EditorSnapshot {
+    return {
+      paragraphs: [...paragraphs],
+      paragraphMeta: paragraphMeta.map(m => ({ ...m })),
+      images: images.map(img => ({ ...img })),
+      cursorPara,
+      cursorOffset,
+      selectionStart: selectionStart ? { ...selectionStart } : null,
+      selectionEnd: selectionEnd ? { ...selectionEnd } : null,
+    };
+  }
+
+  /** Restores editor state from a snapshot */
+  function restoreSnapshot(snapshot: EditorSnapshot): void {
+    paragraphs = [...snapshot.paragraphs];
+    paragraphMeta = snapshot.paragraphMeta.map(m => ({ ...m }));
+    images = snapshot.images.map(img => ({ ...img }));
+    cursorPara = snapshot.cursorPara;
+    cursorOffset = snapshot.cursorOffset;
+    selectionStart = snapshot.selectionStart ? { ...snapshot.selectionStart } : null;
+    selectionEnd = snapshot.selectionEnd ? { ...snapshot.selectionEnd } : null;
+
+    recomputeDisplayLines();
+    renderAllPages();
+  }
+
+  /** Saves current state to history (immediate, for significant actions) */
+  function saveToHistory(): void {
+    flushHistoryPush();
+    historyManager.push(getEditorSnapshot());
+    updateHistoryState();
+  }
+
+  /** Schedules a history save (debounced, for typing) */
+  function scheduleHistorySave(): void {
+    scheduleHistoryPush(getEditorSnapshot());
+    updateHistoryState();
+  }
+
+  /** Updates the canUndo/canRedo reactive state */
+  function updateHistoryState(): void {
+    canUndo = historyManager.canUndo();
+    canRedo = historyManager.canRedo();
+  }
+
+  /** Performs an undo operation */
+  function performUndo(): void {
+    cancelHistoryPush();
+    const snapshot = historyManager.undo();
+    if (snapshot) {
+      restoreSnapshot(snapshot);
+      updateHistoryState();
+    }
+  }
+
+  /** Performs a redo operation */
+  function performRedo(): void {
+    cancelHistoryPush();
+    const snapshot = historyManager.redo();
+    if (snapshot) {
+      restoreSnapshot(snapshot);
+      updateHistoryState();
+    }
+  }
 
   // Text styling - using stores for font size and family
   let fontSize = $derived($fontSizeStore);
@@ -570,9 +646,61 @@
       }
     }
 
+    // Second pass: Assign page indices based on actual Y positions including paragraph spacing
+    // This ensures text doesn't overflow past the bottom margin
+    const scaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
+    let currentY = 0;
+    let currentPage = 0;
+    let currentColumn = 0;
+    const maxColumnHeight = scaledContentHeight;
+
+    for (let i = 0; i < newDisplayLines.length; i++) {
+      const dl = newDisplayLines[i];
+
+      // Calculate line height for this line
+      let lineHeight = scaledLineHeight;
+      if (dl.isImage && dl.imageHeight) {
+        lineHeight = dl.imageHeight * scaledLineHeight;
+      }
+
+      // Add paragraph spacing after last line of paragraph
+      const spacingAfter = dl.isLastLineOfParagraph ? scaledParagraphSpacing : 0;
+
+      // Check if this line would overflow the current column/page
+      if (currentY + lineHeight > maxColumnHeight && !dl.isPageBreak) {
+        // Move to next column or page
+        if (columnCount > 1 && currentColumn < columnCount - 1) {
+          currentColumn++;
+          currentY = 0;
+        } else {
+          currentPage++;
+          currentColumn = 0;
+          currentY = 0;
+        }
+      }
+
+      // Assign position to this line
+      dl.pageIndex = currentPage;
+      dl.yPosition = currentY;
+      dl.columnIndex = currentColumn;
+
+      // Advance Y position
+      currentY += lineHeight + spacingAfter;
+
+      // Handle page breaks - move to next page
+      if (dl.isPageBreak) {
+        currentPage++;
+        currentColumn = 0;
+        currentY = 0;
+      }
+    }
+
     activeFloats = newActiveFloats;
     displayLines = newDisplayLines;
-    totalPages.set(numPages);
+
+    // Calculate total pages based on assigned page indices
+    const maxPageIndex = newDisplayLines.reduce((max, dl) => Math.max(max, dl.pageIndex ?? 0), 0);
+    totalPages.set(maxPageIndex + 1);
 
     // Update headings store for navigation sidebar
     updateHeadings();
@@ -671,6 +799,9 @@
     requestAnimationFrame(() => {
       recomputeDisplayLines();
       renderAllPages();
+      // Initialize history with initial state
+      historyManager.push(getEditorSnapshot());
+      updateHistoryState();
     });
 
     // Add global paste handler for when textarea might lose focus
@@ -903,6 +1034,70 @@
   }
 
   /**
+   * Calculates image position using pre-computed line positions.
+   * Uses the yPosition stored in the display line for accurate positioning.
+   *
+   * @param docImage - Document image metadata
+   * @param dl - Display line with pre-computed position
+   * @param pageIndex - Page being rendered
+   * @returns Position coordinates and visibility flag
+   */
+  function getImagePositionFromLine(
+    docImage: DocumentImage,
+    dl: DisplayLine,
+    pageIndex: number
+  ): { x: number; y: number; visible: boolean } {
+    const scaledWidth = (docImage.width * $zoomLevel) / 100;
+    const isInline = docImage.wrapStyle === 'inline';
+
+    // Check if image is on this page
+    if (dl.pageIndex !== pageIndex) {
+      return { x: 0, y: 0, visible: false };
+    }
+
+    // For non-inline images with absolute position
+    if (!isInline && docImage.x !== undefined && docImage.y !== undefined) {
+      const pageHeight = contentDims.height;
+      const imagePageIndex = Math.floor(docImage.y / pageHeight);
+
+      if (imagePageIndex === pageIndex) {
+        const yOnPage = docImage.y - (imagePageIndex * pageHeight);
+        const imageX = marginLeft + (docImage.x * $zoomLevel) / 100;
+        const imageY = marginTop + (yOnPage * $zoomLevel) / 100;
+        return { x: imageX, y: imageY, visible: true };
+      }
+      return { x: 0, y: 0, visible: false };
+    }
+
+    // Use pre-computed Y position from layout
+    const imageY = marginTop + (dl.yPosition ?? 0);
+
+    // Calculate column offset for multi-column layout
+    const colIndex = dl.columnIndex ?? 0;
+    const columnOffsetX = colIndex * (columnWidth + columnGap);
+
+    // Calculate X position based on alignment
+    let alignment: 'left' | 'center' | 'right';
+    if (isInline && dl.meta) {
+      const textAlign = dl.meta.align;
+      alignment = textAlign === 'center' ? 'center' : textAlign === 'right' ? 'right' : 'left';
+    } else {
+      alignment = docImage.horizontalAlign || 'left';
+    }
+
+    let imageX: number;
+    if (alignment === 'center') {
+      imageX = marginLeft + columnOffsetX + (columnWidth - scaledWidth) / 2;
+    } else if (alignment === 'right') {
+      imageX = marginLeft + columnOffsetX + columnWidth - scaledWidth;
+    } else {
+      imageX = marginLeft + columnOffsetX;
+    }
+
+    return { x: imageX, y: imageY, visible: true };
+  }
+
+  /**
    * Renders all pages of the document.
    *
    * This is the main rendering function that draws the complete document.
@@ -944,9 +1139,8 @@
       ctx.fillStyle = '#202124';
       ctx.textBaseline = 'top';
 
-      // Calculate which display lines belong to this page
-      const startLine = pageIndex * linesPerPage;
-      const endLine = Math.min(startLine + linesPerPage, displayLines.length);
+      // Get lines belonging to this page using pre-computed pageIndex
+      const pageLines = displayLines.filter(dl => dl.pageIndex === pageIndex);
 
       // Get cursor display position
       const cursorDisplay = paraToDisplayPos(cursorPara, cursorOffset);
@@ -967,7 +1161,7 @@
       }
 
       // === PASS 1: Render "behind" images first (before text) ===
-      for (const dl of displayLines) {
+      for (const dl of pageLines) {
         if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
 
         const docImage = images.find(img => img.id === dl.imageId);
@@ -977,7 +1171,7 @@
         if (!img) continue;
 
         const displayLineIdx = displayLines.indexOf(dl);
-        const pos = getImagePosition(docImage, displayLineIdx, pageIndex, startLine);
+        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
         if (pos.visible) {
           renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
         }
@@ -1009,14 +1203,13 @@
             isVisibleOnPage = true;
           }
         } else {
-          // Use line-based positioning
-          const floatStartLineOnPage = float.startLine - startLine;
-          if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
-            const floatColIndex = columnCount > 1 ? Math.floor(floatStartLineOnPage / linesPerColumn) : 0;
-            const floatLineInCol = columnCount > 1 ? floatStartLineOnPage % linesPerColumn : floatStartLineOnPage;
+          // Find the display line for this float and use pre-computed page assignment
+          const floatLine = displayLines[float.startLine];
+          if (floatLine && floatLine.pageIndex === pageIndex) {
+            // Use pre-computed Y position and column
+            floatY = marginTop + (floatLine.yPosition ?? 0);
+            const floatColIndex = floatLine.columnIndex ?? 0;
             const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
-
-            floatY = marginTop + floatLineInCol * scaledLineHeight;
             floatX = float.side === 'left'
               ? marginLeft + floatColumnOffsetX
               : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
@@ -1030,8 +1223,7 @@
       }
 
       // === PASS 3: Render inline and top-bottom images ===
-      for (let i = startLine; i < endLine; i++) {
-        const dl = displayLines[i];
+      for (const dl of pageLines) {
         if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
 
         const docImage = images.find(img => img.id === dl.imageId);
@@ -1043,33 +1235,26 @@
         const img = loadedImages.get(docImage.id);
         if (!img) continue;
 
-        const pos = getImagePosition(docImage, i, pageIndex, startLine);
+        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
         if (pos.visible) {
           renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
         }
       }
 
       // === PASS 4: Render text ===
-      const scaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
-      let cumulativeSpacing = 0;
-
-      for (let i = startLine; i < endLine; i++) {
-        const lineIndexOnPage = i - startLine;
-        const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
-        const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
-        const columnOffsetX = colIndex * (columnWidth + columnGap);
-
-        const dl = displayLines[i];
-        const y = marginTop + lineInColumn * scaledLineHeight + cumulativeSpacing;
-
-        if (dl.isLastLineOfParagraph) {
-          cumulativeSpacing += scaledParagraphSpacing;
-        }
-
+      for (const dl of pageLines) {
         if (dl.isImage || dl.isPageBreak) continue;
+
+        // Use pre-computed Y position
+        const y = marginTop + (dl.yPosition ?? 0);
+
+        // Calculate column offset for multi-column layout
+        const colIndex = dl.columnIndex ?? 0;
+        const columnOffsetX = colIndex * (columnWidth + columnGap);
 
         const text = dl.text;
         const meta = dl.meta;
+        const lineIndex = displayLines.indexOf(dl);
 
         // Calculate list indent and float offset
         const listIndent = meta.listType !== 'none' ? scaledFontSize * 1.5 : 0;
@@ -1133,10 +1318,10 @@
 
         // Draw selection highlight
         if (selStartDisplay && selEndDisplay) {
-          if (i >= selStartDisplay.line && i <= selEndDisplay.line) {
+          if (lineIndex >= selStartDisplay.line && lineIndex <= selEndDisplay.line) {
             ctx.fillStyle = '#b4d7ff';
-            const startCol = i === selStartDisplay.line ? selStartDisplay.col : 0;
-            const endCol = i === selEndDisplay.line ? selEndDisplay.col : text.length;
+            const startCol = lineIndex === selStartDisplay.line ? selStartDisplay.col : 0;
+            const endCol = lineIndex === selEndDisplay.line ? selEndDisplay.col : text.length;
             const selStartX = x + ctx.measureText(text.substring(0, startCol)).width;
             const selWidth = ctx.measureText(text.substring(startCol, endCol)).width || 5;
             ctx.fillRect(selStartX, y, selWidth, scaledLineHeight);
@@ -1226,7 +1411,7 @@
         }
 
         // Draw cursor
-        if (i === cursorDisplay.line && !selectionStart) {
+        if (lineIndex === cursorDisplay.line && !selectionStart) {
           let cursorX = x;
           if (wordSpacing > 0 && meta.align === 'justify') {
             const textBeforeCursor = text.substring(0, cursorDisplay.col);
@@ -1243,7 +1428,7 @@
       }
 
       // === PASS 5: Render "in-front" images last (after text) ===
-      for (const dl of displayLines) {
+      for (const dl of pageLines) {
         if (!dl.isImage || !dl.imageId || !dl.imageHeight) continue;
 
         const docImage = images.find(img => img.id === dl.imageId);
@@ -1252,8 +1437,7 @@
         const img = loadedImages.get(docImage.id);
         if (!img) continue;
 
-        const displayLineIdx = displayLines.indexOf(dl);
-        const pos = getImagePosition(docImage, displayLineIdx, pageIndex, startLine);
+        const pos = getImagePositionFromLine(docImage, dl, pageIndex);
         if (pos.visible) {
           renderImage(ctx, docImage, img, pos.x, pos.y, pageIndex);
         }
@@ -1328,6 +1512,7 @@
             const text = getSelectedText();
             navigator.clipboard.writeText(text);
             if (key.toLowerCase() === 'x') {
+              saveToHistory(); // Save before cut
               deleteSelection();
             }
           }
@@ -1335,12 +1520,28 @@
           return;
         case 'v':
           event.preventDefault();
+          saveToHistory(); // Save before paste
           navigator.clipboard.readText().then(text => {
             if (selectionStart) {
               deleteSelection();
             }
             insertText(text);
           });
+          return;
+        case 'z':
+          event.preventDefault();
+          if (event.shiftKey) {
+            // Ctrl+Shift+Z = Redo
+            performRedo();
+          } else {
+            // Ctrl+Z = Undo
+            performUndo();
+          }
+          return;
+        case 'y':
+          // Ctrl+Y = Redo
+          event.preventDefault();
+          performRedo();
           return;
       }
     }
@@ -1417,6 +1618,7 @@
 
       case 'Backspace':
         event.preventDefault();
+        saveToHistory(); // Save state before deletion
         if (selectionStart && selectionEnd) {
           deleteSelection();
         } else if (cursorOffset > 0) {
@@ -1445,6 +1647,7 @@
 
       case 'Delete':
         event.preventDefault();
+        saveToHistory(); // Save state before deletion
         if (selectionStart && selectionEnd) {
           deleteSelection();
         } else if (cursorOffset < paragraphs[cursorPara].length) {
@@ -1469,6 +1672,7 @@
 
       case 'Enter':
         event.preventDefault();
+        saveToHistory(); // Save state before new paragraph
         if (selectionStart && selectionEnd) {
           deleteSelection();
         }
@@ -1496,9 +1700,11 @@
         if (key.length === 1) {
           event.preventDefault();
           if (selectionStart && selectionEnd) {
+            saveToHistory(); // Save before replacing selection
             deleteSelection();
           }
           insertText(key);
+          scheduleHistorySave(); // Debounced save for typing
         }
     }
 
@@ -1553,6 +1759,7 @@
   }
 
   function insertPageBreak() {
+    saveToHistory(); // Save before inserting page break
     if (selectionStart && selectionEnd) {
       deleteSelection();
     }
@@ -1695,44 +1902,34 @@
       }
     }
 
-    // Calculate display line index accounting for paragraph spacing
-    const startLine = pageIndex * linesPerPage;
-    const endLine = Math.min(startLine + linesPerPage, displayLines.length);
-    const scaledParagraphSpacing = (paragraphSpacingValue * $zoomLevel) / 100;
+    // Find display line index using pre-computed page assignments
     const yInContent = y - marginTop;
+    const pageLines = displayLines.filter(dl => dl.pageIndex === pageIndex);
 
     let displayLineIndex = -1;
-    let cumulativeSpacing = 0;
 
-    for (let i = startLine; i < endLine; i++) {
-      const lineIndexOnPage = i - startLine;
-      const colIndex = columnCount > 1 ? Math.floor(lineIndexOnPage / linesPerColumn) : 0;
+    // Find the line at the clicked Y position using pre-computed yPosition
+    for (const dl of pageLines) {
+      if (dl.yPosition === undefined) continue;
 
-      if (colIndex !== clickedColumn) {
-        const dl = displayLines[i];
-        if (dl && dl.isLastLineOfParagraph) {
-          cumulativeSpacing += scaledParagraphSpacing;
-        }
-        continue;
+      // Calculate line height for this line
+      let lineHeight = scaledLineHeight;
+      if (dl.isImage && dl.imageHeight) {
+        lineHeight = dl.imageHeight * scaledLineHeight;
       }
 
-      const lineInColumn = columnCount > 1 ? lineIndexOnPage % linesPerColumn : lineIndexOnPage;
-      const lineY = lineInColumn * scaledLineHeight + cumulativeSpacing;
-      const lineBottom = lineY + scaledLineHeight;
+      const lineY = dl.yPosition;
+      const lineBottom = lineY + lineHeight;
 
       if (yInContent >= lineY && yInContent < lineBottom) {
-        displayLineIndex = i;
+        displayLineIndex = displayLines.indexOf(dl);
         break;
-      }
-
-      const dl = displayLines[i];
-      if (dl && dl.isLastLineOfParagraph) {
-        cumulativeSpacing += scaledParagraphSpacing;
       }
     }
 
-    if (displayLineIndex === -1 && yInContent >= 0) {
-      displayLineIndex = endLine - 1;
+    // If click is below all lines, select the last line on the page
+    if (displayLineIndex === -1 && yInContent >= 0 && pageLines.length > 0) {
+      displayLineIndex = displayLines.indexOf(pageLines[pageLines.length - 1]);
     }
 
     // Check if clicked on a float image first
@@ -1758,15 +1955,12 @@
             isVisibleOnPage = true;
           }
         } else {
-          // Use line-based positioning (accounting for columns)
-          const floatStartLineOnPage = float.startLine - (pageIndex * linesPerPage);
-          if (floatStartLineOnPage >= 0 && floatStartLineOnPage < linesPerPage) {
-            // Calculate column and line within column for multi-column layout
-            const floatColIndex = columnCount > 1 ? Math.floor(floatStartLineOnPage / linesPerColumn) : 0;
-            const floatLineInCol = columnCount > 1 ? floatStartLineOnPage % linesPerColumn : floatStartLineOnPage;
+          // Use pre-computed page assignment
+          const floatLine = displayLines[float.startLine];
+          if (floatLine && floatLine.pageIndex === pageIndex) {
+            floatY = marginTop + (floatLine.yPosition ?? 0);
+            const floatColIndex = floatLine.columnIndex ?? 0;
             const floatColumnOffsetX = floatColIndex * (columnWidth + columnGap);
-
-            floatY = marginTop + floatLineInCol * scaledLineHeight;
             floatX = float.side === 'left'
               ? marginLeft + floatColumnOffsetX
               : marginLeft + floatColumnOffsetX + columnWidth - scaledWidth;
@@ -1815,12 +2009,13 @@
             imageX = marginLeft + columnOffsetX;
           }
 
-          // Find the first line of this image
+          // Find the first line of this image and use its pre-computed Y position
           let firstImageLine = displayLineIndex;
           while (firstImageLine > 0 && displayLines[firstImageLine - 1].imageId === dl.imageId) {
             firstImageLine--;
           }
-          const imageY = marginTop + (firstImageLine - pageIndex * linesPerPage) * scaledLineHeight;
+          const firstLine = displayLines[firstImageLine];
+          const imageY = marginTop + (firstLine.yPosition ?? 0);
 
           // Check if click is within image bounds
           if (x >= imageX && x <= imageX + scaledWidth && y >= imageY && y <= imageY + scaledHeight) {
@@ -1914,11 +2109,10 @@
       }
     } else if (displayLineIndex < 0) {
       // Clicked above content - go to start of first line on this page
-      const firstLineOnPage = pageIndex * linesPerPage;
-      if (firstLineOnPage < displayLines.length) {
-        const dl = displayLines[firstLineOnPage];
-        cursorPara = dl.paraIndex;
-        cursorOffset = dl.startOffset;
+      const firstLineOnPage = pageLines[0];
+      if (firstLineOnPage) {
+        cursorPara = firstLineOnPage.paraIndex;
+        cursorOffset = firstLineOnPage.startOffset;
       }
     } else {
       // Clicked below content - go to end of last line
@@ -2113,8 +2307,18 @@
       endPara = Math.max(selectionStart.para, selectionEnd.para);
     }
 
+    // Save history for commands that modify the document
+    const documentModifyingCommands = [
+      'justifyLeft', 'justifyCenter', 'justifyRight', 'justifyFull',
+      'insertUnorderedList', 'insertOrderedList',
+      'formatBlock', 'fontSize', 'foreColor'
+    ];
+    if (documentModifyingCommands.includes(command)) {
+      saveToHistory();
+    }
+
     switch (command) {
-      // Text styling
+      // Text styling (these don't modify document state, they affect future input)
       case 'bold':
         isBold = !isBold;
         break;
@@ -2199,11 +2403,13 @@
         }
         break;
 
-      // Undo/Redo (placeholder - would need history implementation)
+      // Undo/Redo
       case 'undo':
+        performUndo();
+        return;
       case 'redo':
-        // TODO: implement undo/redo history
-        break;
+        performRedo();
+        return;
 
       // Image insertion
       case 'insertImage':
@@ -2235,6 +2441,7 @@
 
   async function insertImage(src: string, wrapStyle: ImageWrapStyle = 'inline') {
     try {
+      saveToHistory(); // Save before inserting image
       const img = await loadImage(src);
       const id = generateImageId();
 
@@ -2374,6 +2581,8 @@
   function deleteSelectedImage() {
     if (!selectedImageId) return;
 
+    saveToHistory(); // Save before deleting image
+
     // Find the paragraph containing this image
     const imageParaIndex = paragraphs.findIndex(p => p === IMAGE_MARKER + selectedImageId);
     if (imageParaIndex === -1) return;
@@ -2510,11 +2719,10 @@
     }
 
     // Find the display line for this image
-    const displayLineIdx = displayLines.findIndex(dl => dl.imageId === selectedImageId && dl.isImage);
-    if (displayLineIdx === -1) return null;
+    const displayLine = displayLines.find(dl => dl.imageId === selectedImageId && dl.isImage);
+    if (!displayLine || displayLine.pageIndex === undefined) return null;
 
-    const pageIndex = Math.floor(displayLineIdx / linesPerPage);
-    const lineInPage = displayLineIdx - pageIndex * linesPerPage;
+    const pageIndex = displayLine.pageIndex;
 
     // Check if it's a float
     const float = activeFloats.find(f => f.id === selectedImageId);
@@ -2525,7 +2733,8 @@
       imageX = marginLeft + (scaledContentWidth - destW) / 2;
     }
 
-    const imageY = marginTop + lineInPage * scaledLineHeight;
+    // Use pre-computed Y position
+    const imageY = marginTop + (displayLine.yPosition ?? 0);
 
     return { x: imageX, y: imageY, width: destW, height: destH, pageIndex };
   }
@@ -2864,7 +3073,7 @@
 </script>
 
 <div class="editor-wrapper">
-  <Toolbar onFormat={handleFormat} />
+  <Toolbar onFormat={handleFormat} {canUndo} {canRedo} />
 
   <!-- Hidden canvas for text measurement -->
   <canvas bind:this={measureCanvas} class="measure-canvas"></canvas>

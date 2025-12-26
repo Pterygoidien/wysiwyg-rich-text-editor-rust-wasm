@@ -151,6 +151,12 @@ export interface DisplayLine {
   isPageBreak?: boolean;
   /** Whether this is the last line of its paragraph (for spacing) */
   isLastLineOfParagraph?: boolean;
+  /** Assigned page index (0-based), computed during layout */
+  pageIndex?: number;
+  /** Y position on the page (scaled pixels), computed during layout */
+  yPosition?: number;
+  /** Column index within the page (0-based), computed during layout */
+  columnIndex?: number;
 }
 
 /**

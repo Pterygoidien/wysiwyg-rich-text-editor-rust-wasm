@@ -2,6 +2,81 @@
 
 This document describes the technical architecture of the Rich Text Editor.
 
+## Rendering Approach: Canvas-Based
+
+This editor uses a **pure canvas-based rendering approach** rather than DOM-based or hybrid rendering. All document content (text, images, selections, cursor) is drawn directly to HTML5 `<canvas>` elements.
+
+### Why Canvas?
+
+| Aspect | Canvas Approach | DOM Approach |
+|--------|----------------|--------------|
+| **Pagination** | Full control over page boundaries and content flow | Complex CSS calculations, fragmentation issues |
+| **Multi-column** | Direct positioning within content area | CSS columns lack fine-grained control |
+| **Text wrapping around images** | Custom layout algorithm, pixel-perfect control | CSS `float` has limitations, `shape-outside` browser support varies |
+| **Consistent rendering** | Identical output across browsers | Browser rendering differences |
+| **Print fidelity** | WYSIWYG - what you render is what you print | CSS print styles can differ from screen |
+| **Performance** | Single repaint for entire page, no reflows | DOM changes trigger reflows |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     User Input Layer                             │
+│  ┌──────────────────┐  ┌────────────────┐  ┌─────────────────┐  │
+│  │ Hidden <textarea>│  │  Mouse Events  │  │  Touch Events   │  │
+│  │ (keyboard input) │  │  on <canvas>   │  │  on <canvas>    │  │
+│  └────────┬─────────┘  └───────┬────────┘  └────────┬────────┘  │
+└───────────┼────────────────────┼─────────────────────┼──────────┘
+            │                    │                     │
+            ▼                    ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     State Management                             │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ paragraphs[] │ paragraphMeta[] │ images[] │ cursor │ sel  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Layout Engine                                │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ Paragraph wrapping → DisplayLine[] with page/column/Y     │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Canvas Rendering                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  <canvas>   │  │  <canvas>   │  │  <canvas>   │  ...        │
+│  │   Page 1    │  │   Page 2    │  │   Page N    │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+1. **Hidden Textarea**: Captures keyboard input (the browser handles IME, autocomplete, etc.)
+2. **Layout Engine**: Computes `DisplayLine[]` with pre-computed `pageIndex`, `columnIndex`, and `yPosition`
+3. **Canvas Renderer**: Multi-pass rendering draws content in correct z-order
+4. **Mouse Handlers**: Convert canvas coordinates to document positions
+
+### Trade-offs
+
+**Advantages:**
+- Pixel-perfect pagination with accurate page breaks
+- Multi-column layouts work correctly with text flow
+- Floating images with text wrapping implemented exactly as designed
+- Consistent rendering across all browsers
+- No CSS cascade complexity
+
+**Disadvantages:**
+- No native text selection (must implement custom)
+- No native IME composition preview (using hidden textarea workaround)
+- Accessibility requires extra work (screen readers can't read canvas)
+- No browser spellcheck on canvas (would need external integration)
+- Must implement our own hit testing for clicks
+
 ## High-Level Architecture
 
 ```
