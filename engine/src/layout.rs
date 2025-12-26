@@ -44,7 +44,7 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
-use crate::document::{BlockType, Document, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, Paragraph};
+use crate::document::{BlockType, Document, DocumentTable, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, Paragraph, TableWidthMode};
 
 /// Configuration for page layout
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +155,15 @@ pub struct DisplayLine {
     pub list_type: ListType,
     /// Float reduction for text wrapping around images
     pub float_reduction: Option<FloatReduction>,
+    /// Whether this is a table line
+    #[serde(default)]
+    pub is_table: bool,
+    /// Table ID if this is a table line
+    #[serde(default)]
+    pub table_id: Option<String>,
+    /// Computed table layout (for rendering)
+    #[serde(default)]
+    pub table_layout: Option<TableLayout>,
 }
 
 /// Describes width reduction due to a floating image
@@ -172,6 +181,24 @@ pub struct FloatReduction {
 pub enum FloatSide {
     Left,
     Right,
+}
+
+/// Computed table layout for rendering
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TableLayout {
+    /// Table ID
+    pub table_id: String,
+    /// Computed row heights in pixels
+    pub row_heights: Vec<f64>,
+    /// Computed column widths in pixels
+    pub column_widths: Vec<f64>,
+    /// Total table height in pixels
+    pub total_height: f64,
+    /// Total table width in pixels
+    pub total_width: f64,
+    /// Cell text layouts (row, col) -> wrapped lines
+    pub cell_lines: Vec<Vec<Vec<String>>>,
 }
 
 /// Active floating image for text wrapping
@@ -305,7 +332,41 @@ fn layout_paragraph(
             block_type: meta.block_type,
             list_type: meta.list_type,
             float_reduction: None,
+            is_table: false,
+            table_id: None,
+            table_layout: None,
         }];
+    }
+
+    // Handle table paragraphs
+    if let Some(table_id) = para.table_id() {
+        if let Some(table) = document.tables.iter().find(|t| t.id == table_id) {
+            let table_layout = compute_table_layout(table, config, measure_fn);
+            let table_height = table_layout.total_height;
+
+            return vec![DisplayLine {
+                para_index: para_idx,
+                start_offset: 0,
+                end_offset: para.text.len(),
+                text: String::new(),
+                page_index: 0,
+                column_index: 0,
+                x_position: 0.0,
+                y_position: 0.0,
+                is_page_break: false,
+                is_image: false,
+                image_id: None,
+                image_height: Some(table_height / config.line_height_px()), // Convert to line units
+                list_number: None,
+                is_last_line: true,
+                block_type: meta.block_type,
+                list_type: ListType::None,
+                float_reduction: None,
+                is_table: true,
+                table_id: Some(table_id.to_string()),
+                table_layout: Some(table_layout),
+            }];
+        }
     }
 
     // Handle image paragraphs
@@ -363,6 +424,9 @@ fn layout_paragraph(
                     block_type: meta.block_type,
                     list_type: ListType::None,
                     float_reduction: None,
+                    is_table: false,
+                    table_id: None,
+                    table_layout: None,
                 }];
             }
 
@@ -387,6 +451,9 @@ fn layout_paragraph(
                     block_type: meta.block_type,
                     list_type: ListType::None,
                     float_reduction: None,
+                    is_table: false,
+                    table_id: None,
+                    table_layout: None,
                 }];
             }
 
@@ -410,6 +477,9 @@ fn layout_paragraph(
                     block_type: meta.block_type,
                     list_type: ListType::None,
                     float_reduction: None,
+                    is_table: false,
+                    table_id: None,
+                    table_layout: None,
                 }];
             }
 
@@ -432,6 +502,9 @@ fn layout_paragraph(
                 block_type: meta.block_type,
                 list_type: ListType::None,
                 float_reduction: None,
+                is_table: false,
+                table_id: None,
+                table_layout: None,
             }];
         }
     }
@@ -489,6 +562,9 @@ fn layout_paragraph(
             block_type: meta.block_type,
             list_type: meta.list_type,
             float_reduction,
+            is_table: false,
+            table_id: None,
+            table_layout: None,
         }];
     }
 
@@ -529,6 +605,9 @@ fn layout_paragraph(
                 block_type: meta.block_type,
                 list_type: meta.list_type,
                 float_reduction,
+                is_table: false,
+                table_id: None,
+                table_layout: None,
             });
             break;
         }
@@ -583,6 +662,9 @@ fn layout_paragraph(
             block_type: meta.block_type,
             list_type: meta.list_type,
             float_reduction: float_reduction.clone(),
+            is_table: false,
+            table_id: None,
+            table_layout: None,
         });
 
         current_start = line_end;
@@ -594,6 +676,150 @@ fn layout_paragraph(
     }
 
     lines
+}
+
+/// Compute the layout for a table
+fn compute_table_layout(
+    table: &DocumentTable,
+    config: &LayoutConfig,
+    measure_fn: MeasureFn,
+) -> TableLayout {
+    let available_width = config.column_width();
+    let line_height = config.line_height_px();
+    let font_size = config.font_size;
+    let cell_padding = 8.0; // 4px on each side
+    let border = table.border_width;
+
+    // 1. Calculate column widths based on mode
+    let column_widths: Vec<f64> = match table.width_mode {
+        TableWidthMode::Fixed => table.column_widths.clone(),
+        TableWidthMode::Percentage => {
+            table.column_widths
+                .iter()
+                .map(|w| available_width * w / 100.0)
+                .collect()
+        }
+        TableWidthMode::Auto => {
+            // For now, use percentage mode for auto too
+            table.column_widths
+                .iter()
+                .map(|w| available_width * w / 100.0)
+                .collect()
+        }
+    };
+
+    // 2. Calculate cell text layouts and row heights
+    let mut row_heights: Vec<f64> = Vec::new();
+    let mut cell_lines: Vec<Vec<Vec<String>>> = Vec::new();
+
+    for row in &table.rows {
+        let mut row_cell_lines: Vec<Vec<String>> = Vec::new();
+        let mut max_lines = 1;
+
+        for (col_idx, cell) in row.cells.iter().enumerate() {
+            let cell_width = column_widths.get(col_idx).copied().unwrap_or(100.0) - cell_padding;
+
+            // Wrap cell text
+            let lines = wrap_text_for_cell(&cell.text, cell_width, font_size, measure_fn, config);
+            max_lines = max_lines.max(lines.len());
+            row_cell_lines.push(lines);
+        }
+
+        // Row height = max lines * line_height + padding
+        let row_height = (max_lines as f64 * line_height + cell_padding).max(
+            row.min_height.unwrap_or(line_height + cell_padding)
+        );
+        row_heights.push(row_height);
+        cell_lines.push(row_cell_lines);
+    }
+
+    // 3. Calculate totals
+    let total_height = row_heights.iter().sum::<f64>() + (table.rows.len() + 1) as f64 * border;
+    let total_width = column_widths.iter().sum::<f64>() + (column_widths.len() + 1) as f64 * border;
+
+    TableLayout {
+        table_id: table.id.clone(),
+        row_heights,
+        column_widths,
+        total_height,
+        total_width,
+        cell_lines,
+    }
+}
+
+/// Wrap text for a table cell, returning lines
+/// Handles explicit newlines and word wrapping
+fn wrap_text_for_cell(
+    text: &str,
+    max_width: f64,
+    font_size: f64,
+    measure_fn: MeasureFn,
+    config: &LayoutConfig,
+) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut all_lines: Vec<String> = Vec::new();
+
+    // First, split by explicit newlines
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            all_lines.push(String::new());
+            continue;
+        }
+
+        // Then wrap each paragraph
+        let mut current_start = 0;
+
+        while current_start < paragraph.len() {
+            let remaining = &paragraph[current_start..];
+            let remaining_width = measure_text(measure_fn, remaining, font_size, config.letter_spacing);
+
+            if remaining_width <= max_width {
+                all_lines.push(remaining.to_string());
+                break;
+            }
+
+            // Find break point
+            let mut line_end = current_start;
+            let mut last_word_boundary = current_start;
+
+            for (i, c) in paragraph[current_start..].char_indices() {
+                let pos = current_start + i;
+                let test_text = &paragraph[current_start..=pos];
+                let width = measure_text(measure_fn, test_text, font_size, config.letter_spacing);
+
+                if c == ' ' {
+                    last_word_boundary = pos + 1;
+                }
+
+                if width > max_width {
+                    line_end = if last_word_boundary > current_start {
+                        last_word_boundary
+                    } else {
+                        pos.max(current_start + 1)
+                    };
+                    break;
+                }
+
+                line_end = pos + c.len_utf8();
+            }
+
+            if line_end <= current_start {
+                line_end = current_start + 1;
+            }
+
+            all_lines.push(paragraph[current_start..line_end].to_string());
+            current_start = line_end;
+        }
+    }
+
+    if all_lines.is_empty() {
+        all_lines.push(String::new());
+    }
+
+    all_lines
 }
 
 /// Get float reduction for a given line
@@ -665,7 +891,8 @@ fn assign_page_positions(display_lines: &mut [DisplayLine], config: &LayoutConfi
         }
 
         // Calculate line height for this line
-        let this_line_height = if dl.is_image {
+        // Tables and images use image_height (in line units) for their height
+        let this_line_height = if dl.is_image || dl.is_table {
             dl.image_height.unwrap_or(1.0) * line_height
         } else {
             line_height

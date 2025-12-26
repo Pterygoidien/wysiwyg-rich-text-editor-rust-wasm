@@ -120,6 +120,26 @@ export interface SetGlobalAlphaCommand {
   alpha: number;
 }
 
+// Table render commands
+export interface DrawTableBorderCommand {
+  type: 'drawTableBorder';
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  width: number;
+  color: string;
+}
+
+export interface FillCellBackgroundCommand {
+  type: 'fillCellBackground';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+}
+
 // Position mapping result types
 export interface DisplayPosition {
   line: number;
@@ -143,6 +163,41 @@ export interface ParagraphMeta {
   align: TextAlign;
   blockType: BlockType;
   listType: ListType;
+}
+
+// Table types
+export type TableWidthMode = 'fixed' | 'percentage' | 'auto';
+
+export interface TableCell {
+  text: string;
+  align: TextAlign;
+  background: string | null;
+  col_span: number;
+  row_span: number;
+}
+
+export interface TableRow {
+  cells: TableCell[];
+  min_height: number | null;
+}
+
+export interface TableInfo {
+  id: string;
+  rows: TableRow[];
+  column_widths: number[];
+  border_width: number;
+  border_color: string;
+  width_mode: TableWidthMode;
+}
+
+export interface TableDimensions {
+  rows: number;
+  cols: number;
+}
+
+export interface CellPosition {
+  row: number;
+  col: number;
 }
 
 // Engine type (will be filled when WASM loads)
@@ -219,6 +274,24 @@ export interface Engine {
   set_image_position(id: string, x: number, y: number, pageIndex: number): void;
   clear_image_position(id: string): void;
   set_image_horizontal_align(id: string, align: string): void;
+
+  // Table functions
+  create_table(rows: number, cols: number): string;
+  insert_table_paragraph(index: number, tableId: string): void;
+  get_table(id: string): string | null;
+  get_cell_text(tableId: string, row: number, col: number): string | null;
+  set_cell_text(tableId: string, row: number, col: number, text: string): void;
+  set_cell_background(tableId: string, row: number, col: number, color: string): void;
+  set_cell_align(tableId: string, row: number, col: number, align: string): void;
+  add_table_row(tableId: string, atIndex: number): void;
+  add_table_column(tableId: string, atIndex: number): void;
+  delete_table_row(tableId: string, row: number): boolean;
+  delete_table_column(tableId: string, col: number): boolean;
+  delete_table(id: string): void;
+  set_column_width(tableId: string, col: number, width: number): void;
+  set_table_border(tableId: string, width: number, color: string): void;
+  get_table_dimensions(tableId: string): string | null;
+  get_cell_at_position(tableId: string, relX: number, relY: number): string | null;
 }
 
 /**
@@ -252,6 +325,42 @@ export function parseParagraphMeta(json: string | null): ParagraphMeta | null {
   if (!json) return null;
   try {
     return JSON.parse(json) as ParagraphMeta;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse table info result from engine
+ */
+export function parseTableInfo(json: string | null): TableInfo | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as TableInfo;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse table dimensions result from engine
+ */
+export function parseTableDimensions(json: string | null): TableDimensions | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as TableDimensions;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse cell position result from engine
+ */
+export function parseCellPosition(json: string | null): CellPosition | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as CellPosition;
   } catch {
     return null;
   }
@@ -484,6 +593,24 @@ export function executeRenderCommands(
       case 'setGlobalAlpha': {
         const c = cmd as unknown as SetGlobalAlphaCommand;
         ctx.globalAlpha = c.alpha;
+        break;
+      }
+
+      case 'drawTableBorder': {
+        const c = cmd as unknown as DrawTableBorderCommand;
+        ctx.strokeStyle = c.color;
+        ctx.lineWidth = c.width;
+        ctx.beginPath();
+        ctx.moveTo(c.x1, c.y1);
+        ctx.lineTo(c.x2, c.y2);
+        ctx.stroke();
+        break;
+      }
+
+      case 'fillCellBackground': {
+        const c = cmd as unknown as FillCellBackgroundCommand;
+        ctx.fillStyle = c.color;
+        ctx.fillRect(c.x, c.y, c.width, c.height);
         break;
       }
     }

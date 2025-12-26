@@ -650,6 +650,265 @@ impl Engine {
             self.dirty = true;
         }
     }
+
+    // =========================================================================
+    // Table API
+    // =========================================================================
+
+    /// Create a new table with the specified dimensions and return its ID
+    #[wasm_bindgen]
+    pub fn create_table(&mut self, rows: usize, cols: usize) -> String {
+        let id = format!("table_{}", self.document.tables.len());
+        let table = DocumentTable::new(id.clone(), rows, cols, self.layout_config.column_width());
+        self.document.tables.push(table);
+        self.dirty = true;
+        id
+    }
+
+    /// Insert a table paragraph at the given index
+    #[wasm_bindgen]
+    pub fn insert_table_paragraph(&mut self, index: usize, table_id: &str) {
+        let text = format!("\u{FFFB}{}", table_id);
+        let para = Paragraph::new(text);
+        let idx = index.min(self.document.paragraphs.len());
+        self.document.paragraphs.insert(idx, para);
+        self.dirty = true;
+    }
+
+    /// Get table info by ID as JSON
+    #[wasm_bindgen]
+    pub fn get_table(&self, id: &str) -> JsValue {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == id) {
+            let result = serde_json::to_string(table).unwrap_or_else(|_| "null".to_string());
+            JsValue::from_str(&result)
+        } else {
+            JsValue::NULL
+        }
+    }
+
+    /// Get cell text
+    #[wasm_bindgen]
+    pub fn get_cell_text(&self, table_id: &str, row: usize, col: usize) -> Option<String> {
+        self.document.tables
+            .iter()
+            .find(|t| t.id == table_id)
+            .and_then(|t| t.get_cell(row, col))
+            .map(|c| c.text.clone())
+    }
+
+    /// Set cell text
+    #[wasm_bindgen]
+    pub fn set_cell_text(&mut self, table_id: &str, row: usize, col: usize, text: &str) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell_mut(row, col) {
+                cell.text = text.to_string();
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Set cell background color
+    #[wasm_bindgen]
+    pub fn set_cell_background(&mut self, table_id: &str, row: usize, col: usize, color: &str) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell_mut(row, col) {
+                cell.background = if color.is_empty() { None } else { Some(color.to_string()) };
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Set cell alignment
+    #[wasm_bindgen]
+    pub fn set_cell_align(&mut self, table_id: &str, row: usize, col: usize, align: &str) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            if let Some(cell) = table.get_cell_mut(row, col) {
+                cell.align = match align {
+                    "center" => TextAlign::Center,
+                    "right" => TextAlign::Right,
+                    "justify" => TextAlign::Justify,
+                    _ => TextAlign::Left,
+                };
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Add a row at the specified index
+    #[wasm_bindgen]
+    pub fn add_table_row(&mut self, table_id: &str, at_index: usize) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            table.add_row(at_index);
+            self.dirty = true;
+        }
+    }
+
+    /// Add a column at the specified index
+    #[wasm_bindgen]
+    pub fn add_table_column(&mut self, table_id: &str, at_index: usize) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            table.add_column(at_index);
+            self.dirty = true;
+        }
+    }
+
+    /// Delete a row at the specified index
+    #[wasm_bindgen]
+    pub fn delete_table_row(&mut self, table_id: &str, row: usize) -> bool {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            let result = table.delete_row(row);
+            if result {
+                self.dirty = true;
+            }
+            result
+        } else {
+            false
+        }
+    }
+
+    /// Delete a column at the specified index
+    #[wasm_bindgen]
+    pub fn delete_table_column(&mut self, table_id: &str, col: usize) -> bool {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            let result = table.delete_column(col);
+            if result {
+                self.dirty = true;
+            }
+            result
+        } else {
+            false
+        }
+    }
+
+    /// Delete entire table
+    #[wasm_bindgen]
+    pub fn delete_table(&mut self, id: &str) {
+        // Remove table from tables list
+        self.document.tables.retain(|t| t.id != id);
+
+        // Remove any table paragraphs referencing this table
+        self.document.paragraphs.retain(|p| {
+            if let Some(table_id) = p.table_id() {
+                table_id != id
+            } else {
+                true
+            }
+        });
+        self.dirty = true;
+    }
+
+    /// Set column width
+    #[wasm_bindgen]
+    pub fn set_column_width(&mut self, table_id: &str, col: usize, width: f64) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            if col < table.column_widths.len() {
+                table.column_widths[col] = width;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Set table border style
+    #[wasm_bindgen]
+    pub fn set_table_border(&mut self, table_id: &str, width: f64, color: &str) {
+        if let Some(table) = self.document.tables.iter_mut().find(|t| t.id == table_id) {
+            table.border_width = width;
+            table.border_color = color.to_string();
+            self.dirty = true;
+        }
+    }
+
+    /// Get table dimensions as JSON { rows, cols }
+    #[wasm_bindgen]
+    pub fn get_table_dimensions(&self, table_id: &str) -> JsValue {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == table_id) {
+            let result = serde_json::json!({
+                "rows": table.num_rows(),
+                "cols": table.num_cols(),
+            });
+            JsValue::from_str(&result.to_string())
+        } else {
+            JsValue::NULL
+        }
+    }
+
+    /// Get cell at click position within a table
+    /// Returns JSON { row, col } or null if not found
+    #[wasm_bindgen]
+    pub fn get_cell_at_position(&self, table_id: &str, rel_x: f64, rel_y: f64) -> JsValue {
+        if let Some(table) = self.document.tables.iter().find(|t| t.id == table_id) {
+            let border = table.border_width;
+            let available_width = self.layout_config.column_width();
+            let line_height = self.layout_config.line_height_px();
+            let cell_padding = 8.0;
+
+            // Compute column widths (percentage mode)
+            let column_widths: Vec<f64> = table.column_widths
+                .iter()
+                .map(|w| available_width * w / 100.0)
+                .collect();
+
+            // Compute row heights based on cell content
+            let mut row_heights: Vec<f64> = Vec::new();
+            for row in &table.rows {
+                let mut max_lines = 1usize;
+                for (col_idx, cell) in row.cells.iter().enumerate() {
+                    let cell_width = column_widths.get(col_idx).copied().unwrap_or(100.0) - cell_padding;
+                    // Estimate lines needed for this cell's text
+                    let text_width = self.measure_text_width(&cell.text);
+                    let lines = if cell_width > 0.0 && text_width > 0.0 {
+                        ((text_width / cell_width).ceil() as usize).max(1)
+                    } else {
+                        // Count explicit newlines too
+                        cell.text.matches('\n').count() + 1
+                    };
+                    max_lines = max_lines.max(lines);
+                }
+                let row_height = (max_lines as f64 * line_height + cell_padding)
+                    .max(row.min_height.unwrap_or(line_height + cell_padding));
+                row_heights.push(row_height);
+            }
+
+            // Find row by Y position
+            let mut y = border;
+            let mut found_row = None;
+            for (row_idx, &row_height) in row_heights.iter().enumerate() {
+                if rel_y >= y && rel_y < y + row_height {
+                    found_row = Some(row_idx);
+                    break;
+                }
+                y += row_height + border;
+            }
+
+            // Find column by X position
+            let mut x = border;
+            let mut found_col = None;
+            for (col_idx, &col_width) in column_widths.iter().enumerate() {
+                if rel_x >= x && rel_x < x + col_width {
+                    found_col = Some(col_idx);
+                    break;
+                }
+                x += col_width + border;
+            }
+
+            if let (Some(row), Some(col)) = (found_row, found_col) {
+                let result = serde_json::json!({
+                    "row": row,
+                    "col": col,
+                });
+                return JsValue::from_str(&result.to_string());
+            }
+        }
+        JsValue::NULL
+    }
+
+    /// Measure text width using layout config
+    fn measure_text_width(&self, text: &str) -> f64 {
+        // Simple estimation: character count * average character width
+        // This is a rough approximation; actual width depends on font
+        let avg_char_width = self.layout_config.font_size * 0.6;
+        text.chars().count() as f64 * avg_char_width
+    }
 }
 
 impl Default for Engine {

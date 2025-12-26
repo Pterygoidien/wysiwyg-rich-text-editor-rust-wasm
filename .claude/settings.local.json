@@ -25,7 +25,8 @@
       "Bash(powershell.exe -Command \"npm run build 2>&1 | Out-String\")",
       "Bash(wasm-pack build:*)",
       "Bash(dir:*)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(powershell.exe -Command \"cd ''c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\\\\engine''; cargo check 2>&1 | Out-String\")"
     ]
   }
 }

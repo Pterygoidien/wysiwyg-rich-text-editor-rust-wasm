@@ -46,6 +46,9 @@ pub struct Document {
     pub paragraphs: Vec<Paragraph>,
     /// All images in the document
     pub images: Vec<DocumentImage>,
+    /// All tables in the document
+    #[serde(default)]
+    pub tables: Vec<DocumentTable>,
 }
 
 impl Document {
@@ -54,6 +57,7 @@ impl Document {
             version: 1,
             paragraphs: vec![Paragraph::new(String::new())],
             images: Vec::new(),
+            tables: Vec::new(),
         }
     }
 }
@@ -285,6 +289,22 @@ impl Paragraph {
             None
         }
     }
+
+    /// Check if this paragraph is a table marker
+    /// Uses Unicode annotation terminator U+FFFB as marker
+    pub fn is_table(&self) -> bool {
+        self.text.starts_with('\u{FFFB}')
+    }
+
+    /// Get table ID if this is a table paragraph
+    pub fn table_id(&self) -> Option<&str> {
+        if self.is_table() {
+            // Skip the U+FFFB marker character (3 bytes in UTF-8)
+            Some(&self.text[3..])
+        } else {
+            None
+        }
+    }
 }
 
 /// Paragraph formatting metadata
@@ -315,9 +335,10 @@ impl Default for ParagraphMeta {
 }
 
 /// Text alignment options
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TextAlign {
+    #[default]
     Left,
     Center,
     Right,
@@ -492,6 +513,225 @@ impl DocumentImage {
     pub fn cropped_width(&self) -> f64 {
         let crop_factor = (100.0 - self.crop_left - self.crop_right) / 100.0;
         self.width * crop_factor
+    }
+}
+
+// ============================================================================
+// Table Support
+// ============================================================================
+
+/// Table width calculation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TableWidthMode {
+    /// Fixed pixel widths for columns
+    #[default]
+    Fixed,
+    /// Column widths as percentage of available width
+    Percentage,
+    /// Auto-fit columns to content
+    Auto,
+}
+
+/// A single table cell
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCell {
+    /// Cell text content
+    pub text: String,
+    /// Text styles for inline formatting
+    #[serde(default)]
+    pub styles: Vec<TextStyle>,
+    /// Cell text alignment
+    #[serde(default)]
+    pub align: TextAlign,
+    /// Cell background color (optional)
+    #[serde(default)]
+    pub background: Option<String>,
+    /// Column span (default 1)
+    #[serde(default = "default_span")]
+    pub col_span: usize,
+    /// Row span (default 1)
+    #[serde(default = "default_span")]
+    pub row_span: usize,
+}
+
+fn default_span() -> usize {
+    1
+}
+
+impl TableCell {
+    pub fn new() -> Self {
+        TableCell {
+            text: String::new(),
+            styles: Vec::new(),
+            align: TextAlign::Left,
+            background: None,
+            col_span: 1,
+            row_span: 1,
+        }
+    }
+
+    pub fn with_text(text: String) -> Self {
+        TableCell {
+            text,
+            styles: Vec::new(),
+            align: TextAlign::Left,
+            background: None,
+            col_span: 1,
+            row_span: 1,
+        }
+    }
+}
+
+impl Default for TableCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A table row containing cells
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableRow {
+    /// Cells in this row
+    pub cells: Vec<TableCell>,
+    /// Minimum row height in pixels (optional)
+    #[serde(default)]
+    pub min_height: Option<f64>,
+}
+
+impl TableRow {
+    pub fn new(num_cols: usize) -> Self {
+        TableRow {
+            cells: (0..num_cols).map(|_| TableCell::new()).collect(),
+            min_height: None,
+        }
+    }
+}
+
+/// A table in the document
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentTable {
+    /// Unique identifier
+    pub id: String,
+    /// Table rows
+    pub rows: Vec<TableRow>,
+    /// Column widths (pixels or percentages depending on width_mode)
+    pub column_widths: Vec<f64>,
+    /// Border width in pixels
+    #[serde(default = "default_border_width")]
+    pub border_width: f64,
+    /// Border color
+    #[serde(default = "default_border_color")]
+    pub border_color: String,
+    /// Width calculation mode
+    #[serde(default)]
+    pub width_mode: TableWidthMode,
+}
+
+fn default_border_width() -> f64 {
+    1.0
+}
+
+fn default_border_color() -> String {
+    "#000000".to_string()
+}
+
+impl DocumentTable {
+    /// Create a new table with the specified dimensions
+    pub fn new(id: String, num_rows: usize, num_cols: usize, _column_width: f64) -> Self {
+        // Default column widths: evenly distributed percentages
+        let col_width = 100.0 / num_cols as f64;
+        let column_widths: Vec<f64> = (0..num_cols).map(|_| col_width).collect();
+
+        DocumentTable {
+            id,
+            rows: (0..num_rows).map(|_| TableRow::new(num_cols)).collect(),
+            column_widths,
+            border_width: 1.0,
+            border_color: "#000000".to_string(),
+            width_mode: TableWidthMode::Percentage,
+        }
+    }
+
+    /// Get the number of columns
+    pub fn num_cols(&self) -> usize {
+        self.column_widths.len()
+    }
+
+    /// Get the number of rows
+    pub fn num_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Get a cell at the specified position
+    pub fn get_cell(&self, row: usize, col: usize) -> Option<&TableCell> {
+        self.rows.get(row).and_then(|r| r.cells.get(col))
+    }
+
+    /// Get a mutable cell at the specified position
+    pub fn get_cell_mut(&mut self, row: usize, col: usize) -> Option<&mut TableCell> {
+        self.rows.get_mut(row).and_then(|r| r.cells.get_mut(col))
+    }
+
+    /// Add a row at the specified index
+    pub fn add_row(&mut self, at_index: usize) {
+        let num_cols = self.num_cols();
+        let index = at_index.min(self.rows.len());
+        self.rows.insert(index, TableRow::new(num_cols));
+    }
+
+    /// Add a column at the specified index
+    pub fn add_column(&mut self, at_index: usize) {
+        let index = at_index.min(self.num_cols());
+
+        // Add cell to each row
+        for row in &mut self.rows {
+            row.cells.insert(index, TableCell::new());
+        }
+
+        // Redistribute column widths
+        let new_width = 100.0 / (self.num_cols() + 1) as f64;
+        self.column_widths.insert(index, new_width);
+
+        // Normalize widths to 100%
+        let total: f64 = self.column_widths.iter().sum();
+        for w in &mut self.column_widths {
+            *w = *w / total * 100.0;
+        }
+    }
+
+    /// Delete a row at the specified index
+    pub fn delete_row(&mut self, row: usize) -> bool {
+        if row < self.rows.len() && self.rows.len() > 1 {
+            self.rows.remove(row);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete a column at the specified index
+    pub fn delete_column(&mut self, col: usize) -> bool {
+        if col < self.num_cols() && self.num_cols() > 1 {
+            for row in &mut self.rows {
+                if col < row.cells.len() {
+                    row.cells.remove(col);
+                }
+            }
+            self.column_widths.remove(col);
+
+            // Normalize widths to 100%
+            let total: f64 = self.column_widths.iter().sum();
+            for w in &mut self.column_widths {
+                *w = *w / total * 100.0;
+            }
+            true
+        } else {
+            false
+        }
     }
 }
 

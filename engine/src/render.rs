@@ -40,8 +40,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlockType, Document, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, TextAlign, TextStyle};
-use crate::layout::{DisplayLine, LayoutConfig};
+use crate::document::{BlockType, Document, DocumentTable, HorizontalAlign, ImagePositionMode, ImageWrapStyle, ListType, TextAlign, TextStyle};
+use crate::layout::{DisplayLine, LayoutConfig, TableLayout};
 
 /// A render command that can be sent to JavaScript for drawing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +126,23 @@ pub enum RenderCommand {
     DrawStrikethrough { x: f64, y: f64, width: f64 },
     /// Set global alpha (opacity) for behind/in-front images
     SetGlobalAlpha { alpha: f64 },
+    /// Draw a table border line
+    DrawTableBorder {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        width: f64,
+        color: String,
+    },
+    /// Fill a table cell background
+    FillCellBackground {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        color: String,
+    },
 }
 
 /// A styled text segment for rendering
@@ -393,6 +410,20 @@ pub fn generate_render_commands(
             continue;
         }
 
+        // Handle tables
+        if dl.is_table {
+            if let Some(table_id) = &dl.table_id {
+                if let Some(table) = document.tables.iter().find(|t| &t.id == table_id) {
+                    if let Some(layout) = &dl.table_layout {
+                        let x = config.margin_left + dl.column_index as f64 * (config.column_width() + config.column_gap);
+                        let y = config.margin_top + dl.y_position;
+                        render_table(table, layout, x, y, &mut commands, config);
+                    }
+                }
+            }
+            continue;
+        }
+
         // Calculate text position
         let y = config.margin_top + dl.y_position;
         let col_offset = dl.column_index as f64 * (config.column_width() + config.column_gap);
@@ -653,5 +684,141 @@ pub fn generate_render_commands(
     });
 
     commands
+}
+
+/// Render a table with borders and cell contents
+fn render_table(
+    table: &DocumentTable,
+    layout: &TableLayout,
+    x: f64,
+    y: f64,
+    commands: &mut Vec<RenderCommand>,
+    config: &LayoutConfig,
+) {
+    let border = table.border_width;
+    let border_color = &table.border_color;
+    let line_height = config.line_height_px();
+    let font_size = config.font_size;
+    let cell_padding = 4.0;
+
+    // 1. Draw cell backgrounds
+    let mut current_y = y + border;
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        let row_height = layout.row_heights.get(row_idx).copied().unwrap_or(line_height);
+        let mut current_x = x + border;
+
+        for (col_idx, cell) in row.cells.iter().enumerate() {
+            let col_width = layout.column_widths.get(col_idx).copied().unwrap_or(100.0);
+
+            // Draw cell background if set
+            if let Some(ref bg) = cell.background {
+                commands.push(RenderCommand::FillCellBackground {
+                    x: current_x,
+                    y: current_y,
+                    width: col_width,
+                    height: row_height,
+                    color: bg.clone(),
+                });
+            }
+            current_x += col_width + border;
+        }
+        current_y += row_height + border;
+    }
+
+    // 2. Draw horizontal border lines
+    let mut line_y = y;
+    for row_height in &layout.row_heights {
+        commands.push(RenderCommand::DrawTableBorder {
+            x1: x,
+            y1: line_y,
+            x2: x + layout.total_width,
+            y2: line_y,
+            width: border,
+            color: border_color.clone(),
+        });
+        line_y += row_height + border;
+    }
+    // Bottom border
+    commands.push(RenderCommand::DrawTableBorder {
+        x1: x,
+        y1: line_y,
+        x2: x + layout.total_width,
+        y2: line_y,
+        width: border,
+        color: border_color.clone(),
+    });
+
+    // 3. Draw vertical border lines
+    let mut col_x = x;
+    for col_width in &layout.column_widths {
+        commands.push(RenderCommand::DrawTableBorder {
+            x1: col_x,
+            y1: y,
+            x2: col_x,
+            y2: y + layout.total_height,
+            width: border,
+            color: border_color.clone(),
+        });
+        col_x += col_width + border;
+    }
+    // Right border
+    commands.push(RenderCommand::DrawTableBorder {
+        x1: col_x,
+        y1: y,
+        x2: col_x,
+        y2: y + layout.total_height,
+        width: border,
+        color: border_color.clone(),
+    });
+
+    // 4. Draw cell text
+    commands.push(RenderCommand::SetFont {
+        font: "Arial".to_string(),
+        size: font_size,
+        bold: false,
+        italic: false,
+    });
+    commands.push(RenderCommand::SetFillColor {
+        color: "#202124".to_string(),
+    });
+
+    current_y = y + border + cell_padding;
+    for (row_idx, row_cell_lines) in layout.cell_lines.iter().enumerate() {
+        let row_height = layout.row_heights.get(row_idx).copied().unwrap_or(line_height);
+        let mut current_x = x + border + cell_padding;
+
+        for (col_idx, cell_lines) in row_cell_lines.iter().enumerate() {
+            let col_width = layout.column_widths.get(col_idx).copied().unwrap_or(100.0);
+
+            // Get cell alignment
+            let cell_align = table.rows.get(row_idx)
+                .and_then(|r| r.cells.get(col_idx))
+                .map(|c| c.align)
+                .unwrap_or(TextAlign::Left);
+
+            // Render each line of cell text
+            let mut text_y = current_y;
+            for line in cell_lines {
+                if !line.is_empty() {
+                    // Calculate x position based on alignment
+                    let text_x = match cell_align {
+                        TextAlign::Left => current_x,
+                        TextAlign::Center => current_x + (col_width - 2.0 * cell_padding) / 2.0,
+                        TextAlign::Right => current_x + col_width - 2.0 * cell_padding,
+                        TextAlign::Justify => current_x,
+                    };
+
+                    commands.push(RenderCommand::DrawText {
+                        text: line.clone(),
+                        x: text_x,
+                        y: text_y,
+                    });
+                }
+                text_y += line_height;
+            }
+            current_x += col_width + border;
+        }
+        current_y += row_height + border;
+    }
 }
 

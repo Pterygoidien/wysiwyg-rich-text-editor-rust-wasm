@@ -9,13 +9,14 @@
   // Special markers used by the engine
   const IMAGE_MARKER = '\u{FFFC}';  // Object replacement character
   const PAGE_BREAK_MARKER = '\u{FFFD}';  // Replacement character
+  const TABLE_MARKER = '\u{FFFB}';  // Annotation terminator
 
   /**
-   * Check if a paragraph is a special paragraph (image or page break)
+   * Check if a paragraph is a special paragraph (image, page break, or table)
    * that shouldn't be directly edited
    */
   function isSpecialParagraph(text: string): boolean {
-    return text.startsWith(IMAGE_MARKER) || text === PAGE_BREAK_MARKER;
+    return text.startsWith(IMAGE_MARKER) || text === PAGE_BREAK_MARKER || text.startsWith(TABLE_MARKER);
   }
 
   let pageCanvases: HTMLCanvasElement[] = [];
@@ -80,6 +81,26 @@
   let showImageDialog = $state(false);
   let imageUrlInput = $state('');
   let dragOver = $state(false);
+
+  // Table insertion dialog state
+  let showTableDialog = $state(false);
+  let tableRows = $state(3);
+  let tableCols = $state(3);
+  let tableHasHeaderRow = $state(false);
+  let tableHasHeaderCol = $state(false);
+
+  // Table editing state
+  let activeTableId = $state<string | null>(null);
+  let activeTablePara = $state<number | null>(null);
+  let activeCell = $state<{ row: number; col: number } | null>(null);
+  let cellCursorOffset = $state(0);
+  let cellText = $state('');
+  let showTableContextMenu = $state(false);
+  let tableContextMenuPos = $state({ x: 0, y: 0 });
+
+  // Cell selection for merge operations
+  let cellSelectionStart = $state<{ row: number; col: number } | null>(null);
+  let cellSelectionEnd = $state<{ row: number; col: number } | null>(null);
 
   // Mouse drag selection state
   let isMouseDown = $state(false);
@@ -1096,6 +1117,764 @@
   }
 
   /**
+   * Show table insertion dialog
+   */
+  function showTableInsertDialog() {
+    showTableDialog = true;
+    tableRows = 3;
+    tableCols = 3;
+    tableHasHeaderRow = false;
+    tableHasHeaderCol = false;
+  }
+
+  /**
+   * Close table insertion dialog
+   */
+  function closeTableDialog() {
+    showTableDialog = false;
+    hiddenTextarea?.focus();
+  }
+
+  /**
+   * Insert a table at the current cursor position
+   */
+  function insertTable() {
+    if (!engine) return;
+
+    saveUndoState();
+
+    // Create the table
+    const tableId = engine.create_table(tableRows, tableCols);
+
+    // Apply header styling if selected
+    const headerBgColor = '#f3f3f3';
+    if (tableHasHeaderRow) {
+      for (let col = 0; col < tableCols; col++) {
+        engine.set_cell_background(tableId, 0, col, headerBgColor);
+      }
+    }
+    if (tableHasHeaderCol) {
+      for (let row = 0; row < tableRows; row++) {
+        engine.set_cell_background(tableId, row, 0, headerBgColor);
+      }
+    }
+
+    // Split current paragraph at cursor
+    const currentText = engine.get_paragraph(cursorPara) || '';
+    const beforeCursor = currentText.slice(0, cursorOffset);
+    const afterCursor = currentText.slice(cursorOffset);
+
+    // Update current paragraph with text before cursor
+    engine.set_paragraph(cursorPara, beforeCursor);
+
+    // Insert table paragraph after current paragraph
+    engine.insert_table_paragraph(cursorPara + 1, tableId);
+
+    // Insert new paragraph with text after cursor
+    engine.insert_paragraph(cursorPara + 2, afterCursor);
+
+    // Move cursor to paragraph after the table
+    cursorPara += 2;
+    cursorOffset = 0;
+
+    closeTableDialog();
+    recomputeAndRender();
+  }
+
+  // =========================================================================
+  // Table Cell Editing Functions
+  // =========================================================================
+
+  /**
+   * Check if cursor is currently in a table paragraph
+   */
+  function isInTable(): boolean {
+    if (!engine) return false;
+    const paraText = engine.get_paragraph(cursorPara) || '';
+    return paraText.startsWith(TABLE_MARKER);
+  }
+
+  /**
+   * Get table ID from current paragraph if it's a table
+   */
+  function getCurrentTableId(): string | null {
+    if (!engine) return null;
+    const paraText = engine.get_paragraph(cursorPara) || '';
+    if (paraText.startsWith(TABLE_MARKER)) {
+      return paraText.slice(3); // Skip the 3-byte UTF-8 marker
+    }
+    return null;
+  }
+
+  /**
+   * Get table cell at a given canvas position
+   * Returns table ID, paragraph index, row and column if click is inside a table cell
+   */
+  function getTableCellAtPosition(pageIdx: number, x: number, y: number): { tableId: string; tablePara: number; row: number; col: number } | null {
+    if (!engine) return null;
+
+    try {
+      const displayLinesJson = engine.get_display_lines_json();
+      const displayLines = JSON.parse(displayLinesJson);
+
+      // Find table display lines on this page
+      const tableLinesOnPage = displayLines.filter(
+        (dl: { pageIndex: number; isTable: boolean }) => dl.pageIndex === pageIdx && dl.isTable
+      );
+
+      for (const line of tableLinesOnPage) {
+        if (!line.tableId || !line.tableLayout) continue;
+
+        const tableX = line.xPosition || MARGIN_LEFT;
+        const tableY = MARGIN_TOP + line.yPosition;
+        const tableWidth = line.tableLayout.totalWidth || (PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT);
+        const tableHeight = line.tableLayout.totalHeight;
+
+        // Check if click is within table bounds
+        if (x >= tableX && x <= tableX + tableWidth && y >= tableY && y <= tableY + tableHeight) {
+          // Get cell at relative position within table
+          const relX = x - tableX;
+          const relY = y - tableY;
+
+          const cellJson = engine.get_cell_at_position(line.tableId, relX, relY);
+          if (cellJson) {
+            try {
+              const cell = JSON.parse(cellJson);
+              return {
+                tableId: line.tableId,
+                tablePara: line.paraIndex,
+                row: cell.row,
+                col: cell.col
+              };
+            } catch {
+              // Failed to parse cell
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to get table cell at position:', e);
+    }
+
+    return null;
+  }
+
+  /**
+   * Handle context menu on canvas (right-click)
+   */
+  function handleCanvasContextMenu(event: MouseEvent, pageIdx: number) {
+    if (!engine) return;
+
+    const canvas = pageCanvases[pageIdx];
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const zoomFactor = ZOOM / 100;
+    const x = (event.clientX - rect.left) / zoomFactor;
+    const y = (event.clientY - rect.top) / zoomFactor;
+
+    // Check if right-clicking on a table cell
+    const tableClick = getTableCellAtPosition(pageIdx, x, y);
+    if (tableClick) {
+      event.preventDefault();
+
+      // If not already in this cell, enter it first
+      if (activeTableId !== tableClick.tableId ||
+          activeCell?.row !== tableClick.row ||
+          activeCell?.col !== tableClick.col) {
+        enterTableCell(tableClick.tableId, tableClick.tablePara, tableClick.row, tableClick.col);
+      }
+
+      // Show context menu at click position
+      showTableMenu(event.clientX, event.clientY);
+      return;
+    }
+
+    // If right-clicking outside table while editing, close context menu
+    if (showTableContextMenu) {
+      closeTableMenu();
+    }
+  }
+
+  /**
+   * Enter a table cell for editing
+   */
+  function enterTableCell(tableId: string, tablePara: number, row: number, col: number) {
+    if (!engine) return;
+
+    activeTableId = tableId;
+    activeTablePara = tablePara;
+    activeCell = { row, col };
+    cellText = engine.get_cell_text(tableId, row, col) || '';
+    cellCursorOffset = cellText.length;
+    cellSelectionStart = null;
+    cellSelectionEnd = null;
+
+    // Clear regular cursor/selection
+    selectedImageId = null;
+    showImageOptions = false;
+  }
+
+  /**
+   * Exit table cell editing mode
+   */
+  function exitTableCell() {
+    if (activeTableId && activeCell) {
+      // Save current cell text
+      saveCellText();
+    }
+    activeTableId = null;
+    activeTablePara = null;
+    activeCell = null;
+    cellText = '';
+    cellCursorOffset = 0;
+    cellSelectionStart = null;
+    cellSelectionEnd = null;
+    showTableContextMenu = false;
+  }
+
+  /**
+   * Save current cell text to engine
+   */
+  function saveCellText() {
+    if (!engine || !activeTableId || !activeCell) return;
+    engine.set_cell_text(activeTableId, activeCell.row, activeCell.col, cellText);
+  }
+
+  /**
+   * Get table dimensions
+   */
+  function getTableDimensions(tableId: string): { rows: number; cols: number } | null {
+    if (!engine) return null;
+    const json = engine.get_table_dimensions(tableId);
+    if (!json) return null;
+    try {
+      return JSON.parse(json as string);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Navigate to next cell (Tab key behavior)
+   * Returns true if navigation succeeded, false if at last cell
+   */
+  function goToNextCell(): boolean {
+    if (!engine || !activeTableId || !activeCell) return false;
+
+    const dims = getTableDimensions(activeTableId);
+    if (!dims) return false;
+
+    saveCellText();
+
+    const { row, col } = activeCell;
+
+    // Move to next column
+    if (col < dims.cols - 1) {
+      enterTableCell(activeTableId, activeTablePara!, row, col + 1);
+      return true;
+    }
+
+    // Move to first column of next row
+    if (row < dims.rows - 1) {
+      enterTableCell(activeTableId, activeTablePara!, row + 1, 0);
+      return true;
+    }
+
+    // At last cell
+    return false;
+  }
+
+  /**
+   * Navigate to previous cell (Shift+Tab key behavior)
+   */
+  function goToPreviousCell(): boolean {
+    if (!engine || !activeTableId || !activeCell) return false;
+
+    const dims = getTableDimensions(activeTableId);
+    if (!dims) return false;
+
+    saveCellText();
+
+    const { row, col } = activeCell;
+
+    // Move to previous column
+    if (col > 0) {
+      enterTableCell(activeTableId, activeTablePara!, row, col - 1);
+      return true;
+    }
+
+    // Move to last column of previous row
+    if (row > 0) {
+      enterTableCell(activeTableId, activeTablePara!, row - 1, dims.cols - 1);
+      return true;
+    }
+
+    // At first cell
+    return false;
+  }
+
+  /**
+   * Navigate to cell in direction (arrow key behavior)
+   */
+  function navigateCellDirection(direction: 'up' | 'down' | 'left' | 'right'): 'moved' | 'exit' | 'blocked' {
+    if (!engine || !activeTableId || !activeCell) return 'blocked';
+
+    const dims = getTableDimensions(activeTableId);
+    if (!dims) return 'blocked';
+
+    saveCellText();
+
+    const { row, col } = activeCell;
+    let newRow = row;
+    let newCol = col;
+
+    switch (direction) {
+      case 'up':
+        if (row > 0) newRow = row - 1;
+        else return 'exit'; // Exit table upward
+        break;
+      case 'down':
+        if (row < dims.rows - 1) newRow = row + 1;
+        else return 'exit'; // Exit table downward
+        break;
+      case 'left':
+        if (col > 0) newCol = col - 1;
+        else if (row > 0) { newRow = row - 1; newCol = dims.cols - 1; }
+        else return 'exit'; // Exit table to the left/up
+        break;
+      case 'right':
+        if (col < dims.cols - 1) newCol = col + 1;
+        else if (row < dims.rows - 1) { newRow = row + 1; newCol = 0; }
+        else return 'exit'; // Exit table to the right/down
+        break;
+    }
+
+    enterTableCell(activeTableId, activeTablePara!, newRow, newCol);
+    return 'moved';
+  }
+
+  /**
+   * Add a new row and navigate to it (when Tab at last cell)
+   */
+  function addRowAndNavigate() {
+    if (!engine || !activeTableId || !activeCell) return;
+
+    saveUndoState();
+    saveCellText();
+
+    const dims = getTableDimensions(activeTableId);
+    if (!dims) return;
+
+    // Add row at end
+    engine.add_table_row(activeTableId, dims.rows);
+
+    // Navigate to first cell of new row
+    enterTableCell(activeTableId, activeTablePara!, dims.rows, 0);
+
+    recomputeAndRender();
+  }
+
+  /**
+   * Handle Tab key in table
+   */
+  function handleTableTab(isShift: boolean): boolean {
+    if (!activeTableId || !activeCell) return false;
+
+    if (isShift) {
+      return goToPreviousCell();
+    } else {
+      const moved = goToNextCell();
+      if (!moved) {
+        // At last cell, add new row
+        addRowAndNavigate();
+        return true;
+      }
+      return moved;
+    }
+  }
+
+  /**
+   * Handle Enter key in table cell (insert line break)
+   */
+  function handleTableEnter(): boolean {
+    if (!activeTableId || !activeCell) return false;
+
+    // Insert newline at cursor position
+    const before = cellText.slice(0, cellCursorOffset);
+    const after = cellText.slice(cellCursorOffset);
+    cellText = before + '\n' + after;
+    cellCursorOffset++;
+
+    return true;
+  }
+
+  /**
+   * Handle character input in table cell
+   */
+  function handleTableCharInput(char: string) {
+    if (!activeTableId || !activeCell) return;
+
+    const before = cellText.slice(0, cellCursorOffset);
+    const after = cellText.slice(cellCursorOffset);
+    cellText = before + char + after;
+    cellCursorOffset++;
+  }
+
+  /**
+   * Handle Backspace in table cell
+   */
+  function handleTableBackspace(): boolean {
+    if (!activeTableId || !activeCell) return false;
+
+    if (cellCursorOffset > 0) {
+      const before = cellText.slice(0, cellCursorOffset - 1);
+      const after = cellText.slice(cellCursorOffset);
+      cellText = before + after;
+      cellCursorOffset--;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Handle Delete in table cell
+   */
+  function handleTableDelete(): boolean {
+    if (!activeTableId || !activeCell) return false;
+
+    if (cellCursorOffset < cellText.length) {
+      const before = cellText.slice(0, cellCursorOffset);
+      const after = cellText.slice(cellCursorOffset + 1);
+      cellText = before + after;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Handle arrow keys within table cell
+   */
+  function handleTableArrowKey(key: string): boolean {
+    if (!engine || !activeTableId || !activeCell || activeTablePara === null) return false;
+
+    if (key === 'ArrowLeft') {
+      if (cellCursorOffset > 0) {
+        cellCursorOffset--;
+        return true;
+      }
+      // At start of cell, try to move to previous cell
+      const result = navigateCellDirection('left');
+      if (result === 'exit') {
+        // Exit table to paragraph above
+        exitTableAndMoveTo(activeTablePara - 1, 'end');
+      }
+      return result !== 'blocked';
+    } else if (key === 'ArrowRight') {
+      if (cellCursorOffset < cellText.length) {
+        cellCursorOffset++;
+        return true;
+      }
+      // At end of cell, try to move to next cell
+      const result = navigateCellDirection('right');
+      if (result === 'exit') {
+        // Exit table to paragraph below
+        exitTableAndMoveTo(activeTablePara + 1, 'start');
+      }
+      return result !== 'blocked';
+    } else if (key === 'ArrowUp') {
+      // Check if we're on the first line of the cell
+      const textBeforeCursor = cellText.slice(0, cellCursorOffset);
+      const lastNewline = textBeforeCursor.lastIndexOf('\n');
+      if (lastNewline === -1) {
+        // On first line, move to cell above
+        const result = navigateCellDirection('up');
+        if (result === 'exit') {
+          // Exit table to paragraph above
+          exitTableAndMoveTo(activeTablePara - 1, 'end');
+        }
+        return result !== 'blocked';
+      }
+      // Move cursor up within cell (simplified: go to previous line)
+      const lineStart = lastNewline + 1;
+      const posInLine = cellCursorOffset - lineStart;
+      const prevLineEnd = lastNewline;
+      const prevLineStart = textBeforeCursor.lastIndexOf('\n', prevLineEnd - 1) + 1;
+      const prevLineLen = prevLineEnd - prevLineStart;
+      cellCursorOffset = prevLineStart + Math.min(posInLine, prevLineLen);
+      return true;
+    } else if (key === 'ArrowDown') {
+      // Check if we're on the last line of the cell
+      const textAfterCursor = cellText.slice(cellCursorOffset);
+      const nextNewline = textAfterCursor.indexOf('\n');
+      if (nextNewline === -1) {
+        // On last line, move to cell below
+        const result = navigateCellDirection('down');
+        if (result === 'exit') {
+          // Exit table to paragraph below
+          exitTableAndMoveTo(activeTablePara + 1, 'start');
+        }
+        return result !== 'blocked';
+      }
+      // Move cursor down within cell
+      const textBeforeCursor = cellText.slice(0, cellCursorOffset);
+      const currentLineStart = textBeforeCursor.lastIndexOf('\n') + 1;
+      const posInLine = cellCursorOffset - currentLineStart;
+      const nextLineStart = cellCursorOffset + nextNewline + 1;
+      const nextLineEnd = cellText.indexOf('\n', nextLineStart);
+      const nextLineLen = (nextLineEnd === -1 ? cellText.length : nextLineEnd) - nextLineStart;
+      cellCursorOffset = nextLineStart + Math.min(posInLine, nextLineLen);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Exit table and move cursor to specified paragraph
+   * Creates a new paragraph if needed to avoid cursor landing on the table
+   */
+  function exitTableAndMoveTo(paraIndex: number, position: 'start' | 'end') {
+    if (!engine) return;
+
+    // Save table paragraph index before exiting
+    const tablePara = activeTablePara;
+
+    saveCellText();
+    exitTableCell();
+
+    const paraCount = engine.paragraph_count();
+
+    // Helper to check if a paragraph is a normal text paragraph (not special)
+    const isNormalParagraph = (idx: number): boolean => {
+      if (idx < 0 || idx >= engine!.paragraph_count()) return false;
+      const text = engine!.get_paragraph(idx) || '';
+      return !isSpecialParagraph(text);
+    };
+
+    // Helper to create a new paragraph after the table
+    const createParagraphAfterTable = () => {
+      if (tablePara === null) return;
+      engine!.insert_paragraph(tablePara + 1, '');
+      cursorPara = tablePara + 1;
+      cursorOffset = 0;
+    };
+
+    // Helper to create a new paragraph before the table
+    const createParagraphBeforeTable = () => {
+      if (tablePara === null) return;
+      engine!.insert_paragraph(tablePara, '');
+      cursorPara = tablePara; // New paragraph is now at tablePara
+      cursorOffset = 0;
+    };
+
+    // Handle edge cases
+    if (paraIndex < 0) {
+      // Before first paragraph - check if we can go there or need to create one
+      const firstText = engine.get_paragraph(0) || '';
+      if (isSpecialParagraph(firstText)) {
+        // First paragraph is special (like a table), create paragraph before it
+        createParagraphBeforeTable();
+      } else {
+        cursorPara = 0;
+        cursorOffset = 0;
+      }
+    } else if (paraIndex >= paraCount) {
+      // After last paragraph - check if last paragraph is the table itself
+      const lastPara = paraCount - 1;
+      const lastText = engine.get_paragraph(lastPara) || '';
+      if (isSpecialParagraph(lastText)) {
+        // Last paragraph is special (the table we just exited), create new one after
+        createParagraphAfterTable();
+      } else {
+        cursorPara = lastPara;
+        cursorOffset = lastText.length;
+      }
+    } else {
+      const text = engine.get_paragraph(paraIndex) || '';
+      // Skip special paragraphs (images, page breaks, tables)
+      if (isSpecialParagraph(text)) {
+        // Check if it's a table - if so, enter it
+        if (text.startsWith(TABLE_MARKER)) {
+          const tableId = text.substring(1);
+          if (position === 'start') {
+            enterTableCell(tableId, paraIndex, 0, 0);
+          } else {
+            const dims = engine.get_table_dimensions(tableId);
+            if (dims) {
+              const { rows } = JSON.parse(dims);
+              enterTableCell(tableId, paraIndex, rows - 1, 0);
+            } else {
+              enterTableCell(tableId, paraIndex, 0, 0);
+            }
+          }
+          return;
+        }
+        // For other special paragraphs, try next/previous or create new paragraph
+        if (position === 'start') {
+          // Moving down - look for next normal paragraph or create one
+          let found = false;
+          for (let i = paraIndex + 1; i < paraCount; i++) {
+            if (isNormalParagraph(i)) {
+              cursorPara = i;
+              cursorOffset = 0;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            // No normal paragraph found after, create one after the table
+            createParagraphAfterTable();
+          }
+        } else {
+          // Moving up - look for previous normal paragraph or create one
+          let found = false;
+          for (let i = paraIndex - 1; i >= 0; i--) {
+            if (isNormalParagraph(i)) {
+              const prevText = engine.get_paragraph(i) || '';
+              cursorPara = i;
+              cursorOffset = prevText.length;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            // No normal paragraph found before, create one before the table
+            createParagraphBeforeTable();
+          }
+        }
+      } else {
+        cursorPara = paraIndex;
+        cursorOffset = position === 'start' ? 0 : text.length;
+      }
+    }
+  }
+
+  // =========================================================================
+  // Table Context Menu Functions
+  // =========================================================================
+
+  /**
+   * Show table context menu
+   */
+  function showTableMenu(x: number, y: number) {
+    tableContextMenuPos = { x, y };
+    showTableContextMenu = true;
+  }
+
+  /**
+   * Close table context menu
+   */
+  function closeTableMenu() {
+    showTableContextMenu = false;
+  }
+
+  /**
+   * Add row above current cell
+   */
+  function addRowAbove() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    saveCellText();
+    engine.add_table_row(activeTableId, activeCell.row);
+    activeCell = { row: activeCell.row + 1, col: activeCell.col };
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Add row below current cell
+   */
+  function addRowBelow() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    saveCellText();
+    engine.add_table_row(activeTableId, activeCell.row + 1);
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Add column to the left of current cell
+   */
+  function addColumnLeft() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    saveCellText();
+    engine.add_table_column(activeTableId, activeCell.col);
+    activeCell = { row: activeCell.row, col: activeCell.col + 1 };
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Add column to the right of current cell
+   */
+  function addColumnRight() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    saveCellText();
+    engine.add_table_column(activeTableId, activeCell.col + 1);
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Delete current row
+   */
+  function deleteCurrentRow() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    const dims = getTableDimensions(activeTableId);
+    if (!dims || dims.rows <= 1) return; // Don't delete last row
+
+    const deleted = engine.delete_table_row(activeTableId, activeCell.row);
+    if (deleted) {
+      // Adjust active cell if needed
+      if (activeCell.row >= dims.rows - 1) {
+        activeCell = { row: dims.rows - 2, col: activeCell.col };
+      }
+      cellText = engine.get_cell_text(activeTableId, activeCell.row, activeCell.col) || '';
+      cellCursorOffset = cellText.length;
+    }
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Delete current column
+   */
+  function deleteCurrentColumn() {
+    if (!engine || !activeTableId || !activeCell) return;
+    saveUndoState();
+    const dims = getTableDimensions(activeTableId);
+    if (!dims || dims.cols <= 1) return; // Don't delete last column
+
+    const deleted = engine.delete_table_column(activeTableId, activeCell.col);
+    if (deleted) {
+      // Adjust active cell if needed
+      if (activeCell.col >= dims.cols - 1) {
+        activeCell = { row: activeCell.row, col: dims.cols - 2 };
+      }
+      cellText = engine.get_cell_text(activeTableId, activeCell.row, activeCell.col) || '';
+      cellCursorOffset = cellText.length;
+    }
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
+   * Delete entire table
+   */
+  function deleteCurrentTable() {
+    if (!engine || !activeTableId || activeTablePara === null) return;
+    saveUndoState();
+    engine.delete_table(activeTableId);
+    exitTableCell();
+    closeTableMenu();
+    recomputeAndRender();
+  }
+
+  /**
    * Handle format commands from the toolbar
    */
   function handleFormat(command: string, value?: string) {
@@ -1168,6 +1947,11 @@
       // Images
       case 'insertImage':
         showImageInsertDialog();
+        break;
+
+      // Tables
+      case 'insertTable':
+        showTableInsertDialog();
         break;
 
       default:
@@ -1453,6 +2237,11 @@
       drawCursor(ctx);
     }
 
+    // Draw cell cursor when editing a table cell (on appropriate page)
+    if (activeTableId && activeCell) {
+      drawCellCursor(ctx, pageIdx);
+    }
+
     // Draw resize handles if an image is selected on this page
     if (selectedImageId) {
       const bounds = getSelectedImageBounds();
@@ -1575,8 +2364,70 @@
     }
   }
 
+  function drawCellCursor(ctx: CanvasRenderingContext2D, pageIdx: number) {
+    if (!engine || !cursorVisible || !isFocused) return;
+    if (!activeTableId || !activeCell) return;
+
+    try {
+      const displayLinesJson = engine.get_display_lines_json();
+      const displayLines = JSON.parse(displayLinesJson);
+
+      // Find the display line for this table on this page
+      const tableLine = displayLines.find(
+        (dl: { pageIndex: number; isTable: boolean; tableId?: string }) =>
+          dl.pageIndex === pageIdx && dl.isTable && dl.tableId === activeTableId
+      );
+
+      if (!tableLine || !tableLine.tableLayout) return;
+
+      const layout = tableLine.tableLayout;
+      const { row, col } = activeCell;
+
+      // Calculate cell position
+      const tableX = tableLine.xPosition || MARGIN_LEFT;
+      const tableY = MARGIN_TOP + tableLine.yPosition;
+      const borderWidth = 1; // Default border width
+      const cellPadding = 4;
+
+      // Calculate column X position
+      let cellX = tableX + borderWidth;
+      for (let c = 0; c < col; c++) {
+        cellX += (layout.columnWidths[c] || 0) + borderWidth;
+      }
+
+      // Calculate row Y position
+      let cellY = tableY + borderWidth;
+      for (let r = 0; r < row; r++) {
+        cellY += (layout.rowHeights[r] || 0) + borderWidth;
+      }
+
+      // Get text up to cursor position
+      const textBeforeCursor = cellText.substring(0, cellCursorOffset);
+
+      // Handle multi-line text in cell
+      const lines = textBeforeCursor.split('\n');
+      const currentLineIndex = lines.length - 1;
+      const currentLineText = lines[currentLineIndex];
+
+      ctx.font = `${FONT_SIZE}px ${FONT_FAMILY}`;
+      const textWidth = ctx.measureText(currentLineText).width;
+
+      const lineHeightPx = FONT_SIZE * LINE_HEIGHT;
+      const cursorX = cellX + cellPadding + textWidth;
+      const cursorY = cellY + cellPadding + (currentLineIndex * lineHeightPx);
+
+      ctx.fillStyle = '#000';
+      ctx.fillRect(cursorX, cursorY + 2, 2, lineHeightPx - 4);
+    } catch (e) {
+      console.error('Failed to draw cell cursor:', e);
+    }
+  }
+
   function drawCursor(ctx: CanvasRenderingContext2D) {
     if (!engine || !cursorVisible || !isFocused) return;
+
+    // If editing a table cell, don't draw the regular cursor
+    if (activeTableId && activeCell) return;
 
     const posJson = engine.para_to_display_pos(cursorPara, cursorOffset);
     if (!posJson) return;
@@ -1680,6 +2531,93 @@
 
     const key = event.key;
     const isShift = event.shiftKey;
+
+    // =========================================================================
+    // Table cell editing mode
+    // =========================================================================
+    if (activeTableId && activeCell) {
+      // Escape exits table editing
+      if (key === 'Escape') {
+        event.preventDefault();
+        saveCellText();
+        exitTableCell();
+        recomputeAndRender();
+        return;
+      }
+
+      // Tab/Shift+Tab navigation
+      if (key === 'Tab') {
+        event.preventDefault();
+        handleTableTab(isShift);
+        recomputeAndRender();
+        return;
+      }
+
+      // Enter inserts newline in cell
+      if (key === 'Enter' && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        handleTableEnter();
+        saveCellText();
+        recomputeAndRender();
+        return;
+      }
+
+      // Arrow keys for navigation within/between cells
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(key)) {
+        event.preventDefault();
+        handleTableArrowKey(key);
+        recomputeAndRender();
+        return;
+      }
+
+      // Backspace
+      if (key === 'Backspace') {
+        event.preventDefault();
+        handleTableBackspace();
+        saveCellText();
+        recomputeAndRender();
+        return;
+      }
+
+      // Delete
+      if (key === 'Delete') {
+        event.preventDefault();
+        handleTableDelete();
+        saveCellText();
+        recomputeAndRender();
+        return;
+      }
+
+      // Home/End within cell
+      if (key === 'Home') {
+        event.preventDefault();
+        const lineStart = cellText.lastIndexOf('\n', cellCursorOffset - 1) + 1;
+        cellCursorOffset = lineStart;
+        return;
+      }
+      if (key === 'End') {
+        event.preventDefault();
+        const lineEnd = cellText.indexOf('\n', cellCursorOffset);
+        cellCursorOffset = lineEnd === -1 ? cellText.length : lineEnd;
+        return;
+      }
+
+      // Character input
+      if (key.length === 1 && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        handleTableCharInput(key);
+        saveCellText();
+        recomputeAndRender();
+        return;
+      }
+
+      // Pass through Ctrl+C, Ctrl+V, etc. for now
+      return;
+    }
+
+    // =========================================================================
+    // Normal editing mode
+    // =========================================================================
 
     // Handle Ctrl/Cmd key combinations
     if (event.ctrlKey || event.metaKey) {
@@ -2141,7 +3079,31 @@
         const newPosJson = engine.display_to_para(newLine, currentPos.col);
         if (newPosJson) {
           const newPos = JSON.parse(newPosJson);
-          cursorPara = newPos.para;
+          const targetPara = newPos.para;
+          const targetText = engine.get_paragraph(targetPara) || '';
+
+          // Check if target is a table paragraph
+          if (targetText.startsWith(TABLE_MARKER)) {
+            const tableId = targetText.substring(1); // Skip the marker (1 char, but 3 bytes in UTF-8)
+            // Enter the table at the appropriate cell
+            if (delta > 0) {
+              // Moving down: enter first row
+              enterTableCell(tableId, targetPara, 0, 0);
+            } else {
+              // Moving up: enter last row
+              const dims = engine.get_table_dimensions(tableId);
+              if (dims) {
+                const { rows, cols } = JSON.parse(dims);
+                enterTableCell(tableId, targetPara, rows - 1, 0);
+              } else {
+                enterTableCell(tableId, targetPara, 0, 0);
+              }
+            }
+            resetCursorBlink();
+            return;
+          }
+
+          cursorPara = targetPara;
           cursorOffset = newPos.offset;
         }
       }
@@ -2297,6 +3259,20 @@
       }
     }
 
+    // Check if clicking on a table cell
+    const tableClick = getTableCellAtPosition(pageIdx, x, y);
+    if (tableClick) {
+      // Enter table cell editing mode
+      enterTableCell(tableClick.tableId, tableClick.tablePara, tableClick.row, tableClick.col);
+      hiddenTextarea?.focus();
+      return;
+    }
+
+    // If clicking outside table while editing, exit table editing
+    if (activeTableId) {
+      exitTableCell();
+    }
+
     const pos = getCursorPositionFromMouse(pageIdx, x, y);
     if (!pos) return;
 
@@ -2440,6 +3416,7 @@
           class="page-canvas"
           onmousedown={(e) => handleCanvasMouseDown(e, pageIdx)}
           onmousemove={(e) => handleCanvasMouseMove(e, pageIdx)}
+          oncontextmenu={(e) => handleCanvasContextMenu(e, pageIdx)}
         ></canvas>
       {/each}
     </div>
@@ -2500,6 +3477,73 @@
           />
 
           <p class="tip">Tip: You can also paste an image directly in the editor (Ctrl+V)</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Table insertion dialog -->
+  {#if showTableDialog}
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="popup-overlay" onclick={closeTableDialog}>
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <div class="popup-dialog table-dialog" onclick={(e) => e.stopPropagation()}>
+        <div class="popup-header">
+          <h3>Insert Table</h3>
+          <button class="popup-close" onclick={closeTableDialog}>&times;</button>
+        </div>
+        <div class="popup-content">
+          <div class="table-size-inputs">
+            <div class="input-group">
+              <label for="table-rows">Rows</label>
+              <input
+                id="table-rows"
+                type="number"
+                min="1"
+                max="50"
+                bind:value={tableRows}
+              />
+            </div>
+            <div class="input-group">
+              <label for="table-cols">Columns</label>
+              <input
+                id="table-cols"
+                type="number"
+                min="1"
+                max="20"
+                bind:value={tableCols}
+              />
+            </div>
+          </div>
+          <div class="table-header-options">
+            <label class="checkbox-label">
+              <input type="checkbox" bind:checked={tableHasHeaderRow} />
+              <span>Header row</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" bind:checked={tableHasHeaderCol} />
+              <span>Header column</span>
+            </label>
+          </div>
+          <div class="table-preview-container">
+            <div class="table-grid" style="--rows: {Math.min(tableRows, 8)}; --cols: {Math.min(tableCols, 8)};">
+              {#each Array(Math.min(tableRows, 8)) as _, r}
+                {#each Array(Math.min(tableCols, 8)) as _, c}
+                  <div
+                    class="table-cell-preview"
+                    class:header-cell={(tableHasHeaderRow && r === 0) || (tableHasHeaderCol && c === 0)}
+                  ></div>
+                {/each}
+              {/each}
+            </div>
+            {#if tableRows > 8 || tableCols > 8}
+              <p class="preview-note">Preview limited to 8×8</p>
+            {/if}
+          </div>
+          <div class="dialog-actions">
+            <button class="btn-secondary" onclick={closeTableDialog}>Cancel</button>
+            <button class="btn-primary" onclick={insertTable}>Insert Table</button>
+          </div>
         </div>
       </div>
     </div>
@@ -2750,6 +3794,82 @@
       </div>
     </div>
   {/if}
+
+  <!-- Table context menu -->
+  {#if showTableContextMenu && activeTableId}
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="table-context-overlay" onclick={closeTableMenu}>
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+      <div
+        class="table-context-menu"
+        style="left: {tableContextMenuPos.x}px; top: {tableContextMenuPos.y}px;"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <div class="context-menu-section">
+          <div class="context-menu-label">Rows</div>
+          <button class="context-menu-btn" onclick={addRowAbove}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M21 6H3v2h18V6zm0-4H3v2h18V2z"/>
+              <path d="M12 22l4-4h-3v-6h-2v6H8l4 4z"/>
+            </svg>
+            Insert Row Above
+          </button>
+          <button class="context-menu-btn" onclick={addRowBelow}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M21 18H3v-2h18v2zm0 4H3v-2h18v2z"/>
+              <path d="M12 2l-4 4h3v6h2V6h3l-4-4z"/>
+            </svg>
+            Insert Row Below
+          </button>
+          <button class="context-menu-btn danger" onclick={deleteCurrentRow}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+            Delete Row
+          </button>
+        </div>
+        <div class="context-menu-divider"></div>
+        <div class="context-menu-section">
+          <div class="context-menu-label">Columns</div>
+          <button class="context-menu-btn" onclick={addColumnLeft}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M6 3v18h2V3H6zM2 3v18h2V3H2z"/>
+              <path d="M22 12l-4-4v3h-6v2h6v3l4-4z"/>
+            </svg>
+            Insert Column Left
+          </button>
+          <button class="context-menu-btn" onclick={addColumnRight}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M16 3v18h2V3h-2zm4 0v18h2V3h-2z"/>
+              <path d="M2 12l4 4v-3h6v-2H6V8l-4 4z"/>
+            </svg>
+            Insert Column Right
+          </button>
+          <button class="context-menu-btn danger" onclick={deleteCurrentColumn}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+            Delete Column
+          </button>
+        </div>
+        <div class="context-menu-divider"></div>
+        <button class="context-menu-btn danger" onclick={deleteCurrentTable}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+          </svg>
+          Delete Table
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Active table cell indicator -->
+  {#if activeTableId && activeCell}
+    <div class="table-cell-indicator">
+      Editing cell ({activeCell.row + 1}, {activeCell.col + 1})
+      <button class="exit-cell-btn" onclick={exitTableCell}>Exit</button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -2977,6 +4097,130 @@
     background: #1557b0;
   }
 
+  /* Table dialog styles */
+  .table-dialog {
+    max-width: 400px;
+  }
+
+  .table-size-inputs {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+
+  .input-group {
+    flex: 1;
+  }
+
+  .input-group label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 14px;
+    color: #5f6368;
+  }
+
+  .input-group input {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid #dadce0;
+    border-radius: 4px;
+    font-size: 14px;
+  }
+
+  .input-group input:focus {
+    outline: none;
+    border-color: #1a73e8;
+  }
+
+  .table-header-options {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 16px;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: #3c4043;
+    cursor: pointer;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+  }
+
+  .table-preview-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 220px;
+    margin-bottom: 20px;
+  }
+
+  .table-grid {
+    display: inline-grid;
+    grid-template-rows: repeat(var(--rows), 24px);
+    grid-template-columns: repeat(var(--cols), 32px);
+    gap: 1px;
+    background: #dadce0;
+    border: 1px solid #dadce0;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .table-cell-preview {
+    background: #f8f9fa;
+  }
+
+  .table-cell-preview.header-cell {
+    background: #e8eaed;
+  }
+
+  .preview-note {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: #9aa0a6;
+  }
+
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .btn-secondary {
+    padding: 8px 16px;
+    background: white;
+    border: 1px solid #dadce0;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    color: #5f6368;
+  }
+
+  .btn-secondary:hover {
+    background: #f1f3f4;
+  }
+
+  .btn-primary {
+    padding: 8px 16px;
+    background: #1a73e8;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  .btn-primary:hover {
+    background: #1557b0;
+  }
+
   /* Image options popup styles */
   .image-options-overlay {
     position: fixed;
@@ -3190,5 +4434,109 @@
 
   .crop-btn.cancel:hover {
     background: rgba(255, 255, 255, 0.1);
+  }
+
+  /* Table context menu styles */
+  .table-context-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 1001;
+  }
+
+  .table-context-menu {
+    position: fixed;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+    min-width: 180px;
+    padding: 8px 0;
+    z-index: 1002;
+  }
+
+  .context-menu-section {
+    padding: 4px 0;
+  }
+
+  .context-menu-label {
+    padding: 4px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #5f6368;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .context-menu-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 16px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 14px;
+    color: #202124;
+    text-align: left;
+    transition: background 0.15s;
+  }
+
+  .context-menu-btn:hover {
+    background: #f1f3f4;
+  }
+
+  .context-menu-btn.danger {
+    color: #d93025;
+  }
+
+  .context-menu-btn.danger:hover {
+    background: #fce8e6;
+  }
+
+  .context-menu-btn svg {
+    flex-shrink: 0;
+    opacity: 0.7;
+  }
+
+  .context-menu-divider {
+    height: 1px;
+    background: #e0e0e0;
+    margin: 4px 0;
+  }
+
+  /* Table cell indicator */
+  .table-cell-indicator {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1a73e8;
+    color: white;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 2px 8px rgba(26, 115, 232, 0.4);
+    z-index: 100;
+  }
+
+  .exit-cell-btn {
+    background: rgba(255, 255, 255, 0.2);
+    border: none;
+    color: white;
+    padding: 4px 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.15s;
+  }
+
+  .exit-cell-btn:hover {
+    background: rgba(255, 255, 255, 0.3);
   }
 </style>
