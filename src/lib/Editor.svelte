@@ -2415,7 +2415,8 @@
     const updatedImage = { ...images[imageIndex], wrapStyle };
 
     // Clear absolute position when switching to move-with-text mode
-    if (updatedImage.positionMode === 'move-with-text') {
+    // or when switching to inline mode (inline images follow paragraph alignment)
+    if (updatedImage.positionMode === 'move-with-text' || wrapStyle === 'inline') {
       updatedImage.x = undefined;
       updatedImage.y = undefined;
       updatedImage.pageIndex = undefined;
@@ -2783,12 +2784,15 @@
     renderAllPages();
   }
 
-  // Start dragging an image - all images can be dragged freely
+  // Start dragging an image - inline images cannot be dragged (they follow text alignment)
   function startDrag(clientX: number, clientY: number, _pageIndex: number) {
     if (!selectedImageId) return;
 
     const docImage = images.find(img => img.id === selectedImageId);
     if (!docImage) return;
+
+    // Inline images cannot be freely positioned - they follow paragraph alignment
+    if (docImage.wrapStyle === 'inline') return;
 
     isDragging = true;
     dragStartX = clientX;
