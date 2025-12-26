@@ -10,7 +10,8 @@
       "Bash(npx tsc:*)",
       "Bash(npm run build:*)",
       "Bash(dir /s /b \"c:\\\\Programmation\\\\projects\\\\medilearn\\\\playgrounds\\\\rich-text-editor-paginated\")",
-      "Bash(findstr:*)"
+      "Bash(findstr:*)",
+      "Bash(cargo install:*)"
     ]
   }
 }
